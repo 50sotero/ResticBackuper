@@ -253,6 +253,21 @@ class CoreSafetyTests(unittest.TestCase):
         value = b"ephemeral-unit-test-value"
         self.assertEqual(value, secret_store.unprotect(secret_store.protect(value)))
 
+    def test_acl_verifier_accepts_current_builtin_administrator_alias(self) -> None:
+        sddl = "D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        with mock.patch("secret_store._dacl_sddl", return_value=sddl):
+            secret_store.verify_restricted_acl(
+                Path("protected"), "S-1-5-21-111-222-333-500"
+            )
+
+    def test_acl_verifier_rejects_builtin_administrator_for_other_users(self) -> None:
+        sddl = "D:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        with mock.patch("secret_store._dacl_sddl", return_value=sddl):
+            with self.assertRaisesRegex(RuntimeError, "unexpected principal"):
+                secret_store.verify_restricted_acl(
+                    Path("protected"), "S-1-5-21-111-222-333-1001"
+                )
+
     def test_stream_command_stops_child_when_progress_callback_fails(self) -> None:
         class FakeJob:
             def __enter__(self):

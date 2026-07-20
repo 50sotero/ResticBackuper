@@ -28,7 +28,7 @@ recovery-test instructions are in the
 SHA-256:
 
 ```text
-aabeb4218cf8ec97e4c13dcdcf6a6b09b27447c960e166f1b3e42e6acf740ac4  ResticBackuper-v0.1.0-alpha.1-windows-x64.zip
+1e579eb4764fbdf02310bd7d8500fff91c43206a85e406b0ef3eba7320348db1  ResticBackuper-v0.1.0-alpha.1-windows-x64.zip
 ```
 
 ## Alpha warning

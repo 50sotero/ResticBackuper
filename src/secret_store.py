@@ -266,6 +266,12 @@ def verify_restricted_acl(path: Path, user_sid: str | None = None) -> None:
     if not prefix.startswith("D:") or "P" not in prefix[2:]:
         raise RuntimeError(f"ACL inheritance is not protected on {path}: {sddl}")
     allowed_sids = {current_sid, "SY", "BA", "S-1-5-18", "S-1-5-32-544"}
+    # Windows renders the machine's built-in Administrator account (RID 500)
+    # as the SDDL alias ``LA``. Accept that alias only when it represents the
+    # current DPAPI user; otherwise an explicit local-Administrator ACE remains
+    # an unexpected principal.
+    if current_sid.rsplit("-", 1)[-1] == "500":
+        allowed_sids.add("LA")
     entries = re.findall(r"\(([^)]*)\)", sddl)
     if not entries:
         raise RuntimeError(f"ACL has no access entries on {path}: {sddl}")
