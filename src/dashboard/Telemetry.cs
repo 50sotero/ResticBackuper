@@ -1,0 +1,2206 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Web.Script.Serialization;
+
+namespace ResticBackuper.Dashboard
+{
+    public static class TelemetryFormat
+    {
+        public static string FormatBytes(long bytes)
+        {
+            if (bytes < 0)
+            {
+                return "\u2014";
+            }
+
+            string[] units = new string[] { "B", "KiB", "MiB", "GiB", "TiB", "PiB" };
+            double value = bytes;
+            int unit = 0;
+            while (value >= 1024.0 && unit < units.Length - 1)
+            {
+                value /= 1024.0;
+                unit++;
+            }
+
+            if (unit == 0)
+            {
+                return bytes.ToString("N0", CultureInfo.CurrentCulture) + " " + units[unit];
+            }
+
+            string format = value >= 100.0 ? "0" : (value >= 10.0 ? "0.0" : "0.00");
+            return value.ToString(format, CultureInfo.CurrentCulture) + " " + units[unit];
+        }
+
+        public static string FormatDuration(TimeSpan duration)
+        {
+            if (duration < TimeSpan.Zero)
+            {
+                return "\u2014";
+            }
+            if (duration.TotalDays >= 1.0)
+            {
+                return ((int)duration.TotalDays).ToString(CultureInfo.CurrentCulture)
+                    + "d " + duration.Hours.ToString(CultureInfo.CurrentCulture) + "h";
+            }
+            if (duration.TotalHours >= 1.0)
+            {
+                return ((int)duration.TotalHours).ToString(CultureInfo.CurrentCulture)
+                    + "h " + duration.Minutes.ToString("00", CultureInfo.CurrentCulture) + "m";
+            }
+            if (duration.TotalMinutes >= 1.0)
+            {
+                return ((int)duration.TotalMinutes).ToString(CultureInfo.CurrentCulture)
+                    + "m " + duration.Seconds.ToString("00", CultureInfo.CurrentCulture) + "s";
+            }
+            return Math.Max(0, (int)Math.Round(duration.TotalSeconds))
+                .ToString(CultureInfo.CurrentCulture) + "s";
+        }
+
+        public static string FormatCount(long count)
+        {
+            return count < 0 ? "\u2014" : count.ToString("N0", CultureInfo.CurrentCulture);
+        }
+    }
+
+    public sealed class RunMetricView
+    {
+        public DateTime StartedLocal { get; set; }
+        public string RunId { get; set; }
+        public string TypeLabel { get; set; }
+        public string StateLabel { get; set; }
+        public bool Success { get; set; }
+        public double DurationSeconds { get; set; }
+        public long Files { get; set; }
+        public long ProcessedBytes { get; set; }
+        public long StoredBytes { get; set; }
+        public string SnapshotShort { get; set; }
+
+        public string StartedDisplay
+        {
+            get { return StartedLocal.ToString("ddd, d MMM HH:mm", CultureInfo.CurrentCulture); }
+        }
+
+        public string DurationDisplay
+        {
+            get { return TelemetryFormat.FormatDuration(TimeSpan.FromSeconds(Math.Max(0, DurationSeconds))); }
+        }
+
+        public string FilesDisplay
+        {
+            get { return TelemetryFormat.FormatCount(Files); }
+        }
+
+        public string ProcessedBytesDisplay
+        {
+            get { return TelemetryFormat.FormatBytes(ProcessedBytes); }
+        }
+
+        public string ProcessedDisplay
+        {
+            get { return ProcessedBytesDisplay; }
+        }
+
+        public string StoredBytesDisplay
+        {
+            get { return TelemetryFormat.FormatBytes(StoredBytes); }
+        }
+
+        public string SnapshotDisplay
+        {
+            get { return string.IsNullOrEmpty(SnapshotShort) ? "\u2014" : SnapshotShort; }
+        }
+
+        public string OutcomeDisplay
+        {
+            get { return Success ? "Successful" : "Needs attention"; }
+        }
+
+        public string SummaryDisplay
+        {
+            get
+            {
+                return TelemetryFormat.FormatCount(Files) + " files \u2022 "
+                    + TelemetryFormat.FormatBytes(ProcessedBytes) + " \u2022 "
+                    + DurationDisplay;
+            }
+        }
+    }
+
+    public sealed class TelemetrySnapshot
+    {
+        public string StateKey { get; set; }
+        public string StatusLabel { get; set; }
+        public string StatusDetail { get; set; }
+        public bool IsActive { get; set; }
+        public bool IsFailure { get; set; }
+        public bool IsSuccess { get; set; }
+        public double Percent { get; set; }
+        public bool ProgressIsEstimated { get; set; }
+        public string ConfidenceLabel { get; set; }
+        public long FilesDone { get; set; }
+        public long EstimatedFiles { get; set; }
+        public long BytesDone { get; set; }
+        public long EstimatedBytes { get; set; }
+        public long StoredBytes { get; set; }
+        public double TransferRateBytesPerSecond { get; set; }
+        public TimeSpan Elapsed { get; set; }
+        public TimeSpan? Eta { get; set; }
+        public DateTime? EstimatedCompletion { get; set; }
+        public int ErrorCount { get; set; }
+        public int PhaseIndex { get; set; }
+        public string PhaseLabel { get; set; }
+        public DateTime LastUpdatedLocal { get; set; }
+        public string RunId { get; set; }
+        public IList<RunMetricView> History { get; set; }
+
+        public TelemetrySnapshot()
+        {
+            StateKey = "unknown";
+            StatusLabel = "Checking backup status";
+            StatusDetail = "Waiting for telemetry.";
+            ConfidenceLabel = "Waiting for data";
+            PhaseIndex = -1;
+            PhaseLabel = "Waiting";
+            RunId = string.Empty;
+            History = new List<RunMetricView>();
+        }
+    }
+
+    public sealed class TelemetryReader
+    {
+        private const int MaximumJsonLength = 32 * 1024 * 1024;
+        private const int MaximumHistoryRuns = 400;
+        private const int MaximumLiveSamples = 20000;
+        private const double MaximumEtaSeconds = 14.0 * 24.0 * 60.0 * 60.0;
+        private const double MissingProcessGraceSeconds = 120.0;
+        private const double MaximumActiveStatusAgeSeconds = 24.0 * 60.0 * 60.0;
+
+        private readonly string stateDirectory;
+        private readonly string statusPath;
+        private readonly string dryRunLatestPath;
+        private readonly bool allowPersistence;
+        private readonly string dashboardDirectory;
+        private readonly string historyPath;
+        private readonly string liveSamplesPath;
+        private readonly JavaScriptSerializer serializer;
+        private readonly object syncRoot = new object();
+
+        private bool persistenceReady;
+        private bool localCacheLoaded;
+        private List<RunMetricRecord> historyRecords = new List<RunMetricRecord>();
+        private List<LiveSampleRecord> liveSamples = new List<LiveSampleRecord>();
+
+        public TelemetryReader(string stateDirectory, bool allowPersistence)
+        {
+            if (string.IsNullOrWhiteSpace(stateDirectory))
+            {
+                throw new ArgumentException("A protected state directory is required.", "stateDirectory");
+            }
+            if (!Path.IsPathRooted(stateDirectory))
+            {
+                throw new ArgumentException("The protected state directory must be absolute.", "stateDirectory");
+            }
+
+            this.stateDirectory = TrimTrailingSeparators(Path.GetFullPath(stateDirectory));
+            this.statusPath = Path.Combine(this.stateDirectory, "status.json");
+            this.dryRunLatestPath = Path.Combine(this.stateDirectory, "dry-run-latest.json");
+            this.allowPersistence = allowPersistence;
+
+            string localApplicationData = Environment.GetFolderPath(
+                Environment.SpecialFolder.LocalApplicationData);
+            this.dashboardDirectory = string.IsNullOrWhiteSpace(localApplicationData)
+                ? string.Empty
+                : Path.Combine(localApplicationData, "ResticBackuperDashboard");
+            this.historyPath = string.IsNullOrEmpty(this.dashboardDirectory)
+                ? string.Empty
+                : Path.Combine(this.dashboardDirectory, "run-history.json");
+            this.liveSamplesPath = string.IsNullOrEmpty(this.dashboardDirectory)
+                ? string.Empty
+                : Path.Combine(this.dashboardDirectory, "live-samples.json");
+
+            this.serializer = new JavaScriptSerializer();
+            this.serializer.MaxJsonLength = MaximumJsonLength;
+            this.serializer.RecursionLimit = 100;
+
+            if (allowPersistence)
+            {
+                InitializePersistenceDirectory();
+            }
+        }
+
+        public TelemetrySnapshot Load()
+        {
+            lock (syncRoot)
+            {
+                EnsureLocalCacheLoaded();
+
+                JsonReadResult statusRead = ReadJsonObject(statusPath);
+                JsonReadResult dryRunRead = ReadJsonObject(dryRunLatestPath);
+                bool historyChanged = false;
+
+                if (dryRunRead.Document != null)
+                {
+                    RunMetricRecord dryMetric = CreateDryRunMetric(dryRunRead.Document);
+                    if (dryMetric != null)
+                    {
+                        historyChanged |= UpsertMetric(dryMetric);
+                    }
+                }
+                if (statusRead.Document != null)
+                {
+                    RunMetricRecord backupMetric = CreateBackupMetric(statusRead.Document);
+                    if (backupMetric != null)
+                    {
+                        historyChanged |= UpsertMetric(backupMetric);
+                    }
+                }
+
+                TelemetrySnapshot snapshot = BuildSnapshot(statusRead, dryRunRead);
+                snapshot.History = BuildHistoryViews();
+
+                bool samplesChanged = CaptureLiveSample(snapshot);
+                if (historyChanged)
+                {
+                    TryPersistHistory();
+                }
+                if (samplesChanged)
+                {
+                    TryPersistLiveSamples();
+                }
+
+                return snapshot;
+            }
+        }
+
+        public string SelfTestJson()
+        {
+            lock (syncRoot)
+            {
+                JsonReadResult statusRead = ReadJsonObject(statusPath);
+                JsonReadResult dryRunRead = ReadJsonObject(dryRunLatestPath);
+                JsonReadResult historyRead = string.IsNullOrEmpty(historyPath)
+                    ? JsonReadResult.Missing()
+                    : ReadJsonObject(historyPath);
+                JsonReadResult samplesRead = string.IsNullOrEmpty(liveSamplesPath)
+                    ? JsonReadResult.Missing()
+                    : ReadJsonObject(liveSamplesPath);
+
+                bool protectedTelemetryAvailable = statusRead.Document != null
+                    || dryRunRead.Document != null;
+                bool protectedTelemetryValid = (!statusRead.Exists || statusRead.Document != null)
+                    && (!dryRunRead.Exists || dryRunRead.Document != null);
+
+                Dictionary<string, object> result = new Dictionary<string, object>();
+                result["schema_version"] = 1;
+                result["ok"] = Directory.Exists(stateDirectory)
+                    && protectedTelemetryAvailable
+                    && protectedTelemetryValid;
+                result["checked_utc"] = FormatUtc(DateTime.UtcNow);
+                result["state_directory"] = stateDirectory;
+                result["state_directory_exists"] = Directory.Exists(stateDirectory);
+                result["allowed_protected_files"] = new string[] {
+                    "status.json", "dry-run-latest.json"
+                };
+                result["status"] = SelfTestFileResult(statusRead);
+                result["dry_run_latest"] = SelfTestFileResult(dryRunRead);
+                result["local_history"] = SelfTestFileResult(historyRead);
+                result["local_live_samples"] = SelfTestFileResult(samplesRead);
+                result["persistence_configured"] = allowPersistence;
+                result["self_test_write_operations"] = 0;
+                result["restic_invocations"] = 0;
+                result["secret_reads"] = 0;
+                return serializer.Serialize(result);
+            }
+        }
+
+        private Dictionary<string, object> SelfTestFileResult(JsonReadResult read)
+        {
+            Dictionary<string, object> result = new Dictionary<string, object>();
+            result["exists"] = read.Exists;
+            result["valid_json_object"] = read.Document != null;
+            result["bytes"] = read.Length;
+            result["error"] = string.IsNullOrEmpty(read.Error) ? null : read.Error;
+            return result;
+        }
+
+        private void InitializePersistenceDirectory()
+        {
+            persistenceReady = false;
+            if (string.IsNullOrEmpty(dashboardDirectory))
+            {
+                return;
+            }
+            if (PathsOverlap(dashboardDirectory, stateDirectory))
+            {
+                return;
+            }
+
+            try
+            {
+                Directory.CreateDirectory(dashboardDirectory);
+                FileAttributes attributes = File.GetAttributes(dashboardDirectory);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    return;
+                }
+                persistenceReady = true;
+            }
+            catch (Exception error)
+            {
+                if (!IsExpectedIoException(error))
+                {
+                    throw;
+                }
+            }
+        }
+
+        private void EnsureLocalCacheLoaded()
+        {
+            if (localCacheLoaded)
+            {
+                return;
+            }
+            localCacheLoaded = true;
+
+            if (string.IsNullOrEmpty(dashboardDirectory) || !Directory.Exists(dashboardDirectory))
+            {
+                return;
+            }
+            try
+            {
+                if ((File.GetAttributes(dashboardDirectory) & FileAttributes.ReparsePoint) != 0)
+                {
+                    return;
+                }
+            }
+            catch (Exception error)
+            {
+                if (IsExpectedIoException(error))
+                {
+                    return;
+                }
+                throw;
+            }
+
+            JsonReadResult historyRead = ReadJsonObject(historyPath);
+            if (historyRead.Document != null)
+            {
+                historyRecords = ParseHistory(historyRead.Document);
+            }
+
+            JsonReadResult samplesRead = ReadJsonObject(liveSamplesPath);
+            if (samplesRead.Document != null)
+            {
+                liveSamples = ParseLiveSamples(samplesRead.Document);
+            }
+        }
+
+        private TelemetrySnapshot BuildSnapshot(
+            JsonReadResult statusRead,
+            JsonReadResult dryRunRead)
+        {
+            if (statusRead.Document != null)
+            {
+                return BuildBackupSnapshot(statusRead.Document, statusRead.LastWriteUtc);
+            }
+            if (statusRead.Exists)
+            {
+                return BuildTelemetryError(
+                    "Backup status is temporarily unavailable.",
+                    statusRead.Error,
+                    statusRead.LastWriteUtc);
+            }
+            if (dryRunRead.Document != null)
+            {
+                return BuildDryRunSnapshot(dryRunRead.Document, dryRunRead.LastWriteUtc);
+            }
+            if (dryRunRead.Exists)
+            {
+                return BuildTelemetryError(
+                    "The dry-run baseline could not be read.",
+                    dryRunRead.Error,
+                    dryRunRead.LastWriteUtc);
+            }
+
+            TelemetrySnapshot waiting = new TelemetrySnapshot();
+            waiting.StateKey = "waiting";
+            waiting.StatusLabel = "Waiting for the first backup";
+            waiting.StatusDetail = "No backup status or verified dry-run baseline exists yet.";
+            waiting.PhaseLabel = "Ready";
+            waiting.LastUpdatedLocal = DateTime.Now;
+            waiting.ProgressIsEstimated = true;
+            return waiting;
+        }
+
+        private TelemetrySnapshot BuildTelemetryError(
+            string label,
+            string detail,
+            DateTime lastWriteUtc)
+        {
+            TelemetrySnapshot snapshot = new TelemetrySnapshot();
+            snapshot.StateKey = "telemetry_error";
+            snapshot.StatusLabel = label;
+            snapshot.StatusDetail = CleanDisplayText(detail, 240);
+            snapshot.IsFailure = true;
+            snapshot.ProgressIsEstimated = true;
+            snapshot.ConfidenceLabel = "Telemetry unavailable";
+            snapshot.PhaseLabel = "Needs attention";
+            snapshot.LastUpdatedLocal = ToLocalOrNow(lastWriteUtc);
+            return snapshot;
+        }
+
+        private TelemetrySnapshot BuildDryRunSnapshot(
+            IDictionary<string, object> document,
+            DateTime lastWriteUtc)
+        {
+            string state = GetString(document, "state", "unknown").ToLowerInvariant();
+            IDictionary<string, object> summary = GetDictionary(document, "summary");
+            IDictionary<string, object> progress = GetDictionary(document, "progress");
+            long files = FirstNonNegative(
+                GetLong(summary, "total_files_processed", -1),
+                GetLong(progress, "files_done", 0));
+            long bytes = FirstNonNegative(
+                GetLong(summary, "total_bytes_processed", -1),
+                GetLong(progress, "bytes_done", 0));
+            double duration = GetDouble(summary, "total_duration", -1);
+            if (duration < 0)
+            {
+                duration = DurationBetween(document);
+            }
+
+            TelemetrySnapshot snapshot = new TelemetrySnapshot();
+            snapshot.RunId = GetString(document, "run_id", string.Empty);
+            snapshot.FilesDone = Math.Max(0, files);
+            snapshot.EstimatedFiles = Math.Max(0, files);
+            snapshot.BytesDone = Math.Max(0, bytes);
+            snapshot.EstimatedBytes = Math.Max(0, bytes);
+            snapshot.StoredBytes = Math.Max(0, GetLong(summary, "data_added_packed", 0));
+            snapshot.Elapsed = SafeTimeSpan(duration);
+            snapshot.TransferRateBytesPerSecond = duration > 0 && bytes > 0
+                ? bytes / duration
+                : 0;
+            snapshot.ErrorCount = SafeInt(GetLong(document, "error_count", 0));
+            snapshot.LastUpdatedLocal = ToLocalOrNow(lastWriteUtc);
+            snapshot.PhaseIndex = -1;
+            snapshot.PhaseLabel = "Baseline";
+
+            if (state == "clean")
+            {
+                snapshot.StateKey = "ready";
+                snapshot.StatusLabel = "Ready for the first backup";
+                snapshot.StatusDetail = "Verified dry run: "
+                    + TelemetryFormat.FormatCount(snapshot.FilesDone) + " files and "
+                    + TelemetryFormat.FormatBytes(snapshot.BytesDone)
+                    + " scanned with no errors.";
+                snapshot.IsSuccess = false;
+                snapshot.Percent = 0;
+                snapshot.ProgressIsEstimated = true;
+                snapshot.ConfidenceLabel = "Validation baseline ready";
+            }
+            else
+            {
+                snapshot.StateKey = state;
+                snapshot.StatusLabel = state == "source_errors"
+                    ? "Dry run found unreadable files"
+                    : "Dry run needs attention";
+                snapshot.StatusDetail = snapshot.ErrorCount > 0
+                    ? TelemetryFormat.FormatCount(snapshot.ErrorCount) + " source errors were recorded."
+                    : CleanDisplayText(GetString(document, "failure", "The dry run did not complete cleanly."), 240);
+                snapshot.IsFailure = true;
+                snapshot.ProgressIsEstimated = false;
+                snapshot.ConfidenceLabel = "Final dry-run result";
+            }
+            return snapshot;
+        }
+
+        private TelemetrySnapshot BuildBackupSnapshot(
+            IDictionary<string, object> document,
+            DateTime lastWriteUtc)
+        {
+            string state = GetString(document, "state", "unknown").ToLowerInvariant();
+            IDictionary<string, object> progress = GetDictionary(document, "progress");
+            IDictionary<string, object> summary = GetDictionary(document, "summary");
+            bool terminalSuccess = state == "success" || state == "success_unchanged";
+            bool recordedTerminalFailure = state == "failed" || state == "partial";
+            PhaseInfo phase = recordedTerminalFailure
+                ? InferFailurePhase(document, state)
+                : GetPhase(state);
+            bool active = !terminalSuccess && !recordedTerminalFailure
+                && state != "unknown" && state != "waiting";
+
+            DateTime startedUtc;
+            bool hasStarted = TryGetUtc(document, "started_utc", out startedUtc);
+            bool interrupted = active && IsStaleActiveStatus(document, startedUtc, hasStarted, lastWriteUtc);
+            if (interrupted)
+            {
+                active = false;
+                state = "interrupted";
+            }
+            bool terminalFailure = recordedTerminalFailure || interrupted;
+            DateTime finishedUtc;
+            bool hasFinished = TryGetUtc(document, "finished_utc", out finishedUtc);
+            DateTime effectiveEndUtc = hasFinished
+                ? finishedUtc
+                : interrupted && lastWriteUtc != DateTime.MinValue
+                    ? lastWriteUtc
+                    : DateTime.UtcNow;
+            double wrapperElapsed = hasStarted
+                ? (effectiveEndUtc - startedUtc).TotalSeconds
+                : 0;
+            wrapperElapsed = Clamp(wrapperElapsed, 0, MaximumEtaSeconds * 2);
+            double resticElapsed = GetDouble(progress, "seconds_elapsed", -1);
+            double elapsedForRate = resticElapsed > 0 ? resticElapsed : wrapperElapsed;
+
+            long progressFiles = Math.Max(0, GetLong(progress, "files_done", 0));
+            long progressBytes = Math.Max(0, GetLong(progress, "bytes_done", 0));
+            long summaryFiles = Math.Max(0, GetLong(summary, "total_files_processed", 0));
+            long summaryBytes = Math.Max(0, GetLong(summary, "total_bytes_processed", 0));
+            long filesDone = terminalSuccess || terminalFailure
+                ? Math.Max(progressFiles, summaryFiles)
+                : progressFiles;
+            long bytesDone = terminalSuccess || terminalFailure
+                ? Math.Max(progressBytes, summaryBytes)
+                : progressBytes;
+
+            EstimateBaseline baseline = BuildBaseline(
+                GetString(document, "run_id", string.Empty),
+                BuildSourceFingerprint(document));
+            long exactFiles = Math.Max(0, GetLong(progress, "total_files", 0));
+            long exactBytes = Math.Max(0, GetLong(progress, "total_bytes", 0));
+            long estimatedFiles = exactFiles > 0 ? exactFiles : baseline.Files;
+            long estimatedBytes = exactBytes > 0 ? exactBytes : baseline.Bytes;
+            if (estimatedFiles > 0 && filesDone > estimatedFiles)
+            {
+                estimatedFiles = filesDone;
+            }
+            if (estimatedBytes > 0 && bytesDone > estimatedBytes)
+            {
+                estimatedBytes = bytesDone;
+            }
+
+            double resticPercent;
+            bool hasExactPercent = TryGetResticPercent(progress, out resticPercent);
+            List<double> exactFractions = new List<double>();
+            if (hasExactPercent)
+            {
+                exactFractions.Add(resticPercent);
+            }
+            if (exactFiles > 0 && filesDone > 0)
+            {
+                exactFractions.Add(Clamp((double)filesDone / exactFiles, 0, 1));
+            }
+            if (exactBytes > 0 && bytesDone > 0)
+            {
+                exactFractions.Add(Clamp((double)bytesDone / exactBytes, 0, 1));
+            }
+
+            bool exactProgress = exactFractions.Count > 0;
+            double backupFraction;
+            if (exactProgress)
+            {
+                backupFraction = Median(exactFractions);
+            }
+            else
+            {
+                List<double> estimatedFractions = new List<double>();
+                if (estimatedFiles > 0 && filesDone > 0)
+                {
+                    estimatedFractions.Add((double)filesDone / estimatedFiles);
+                }
+                if (estimatedBytes > 0 && bytesDone > 0)
+                {
+                    estimatedFractions.Add((double)bytesDone / estimatedBytes);
+                }
+                if (estimatedFractions.Count > 0)
+                {
+                    backupFraction = Median(estimatedFractions);
+                }
+                else
+                {
+                    double expectedBackupSeconds = baseline.ResticDurationSeconds;
+                    backupFraction = expectedBackupSeconds > 0
+                        ? elapsedForRate / expectedBackupSeconds
+                        : 0;
+                }
+            }
+            backupFraction = Clamp(backupFraction, 0, active || interrupted ? 0.985 : 1);
+
+            TelemetrySnapshot snapshot = new TelemetrySnapshot();
+            snapshot.StateKey = state;
+            snapshot.StatusLabel = interrupted ? "Backup appears interrupted" : phase.StatusLabel;
+            snapshot.IsActive = active;
+            snapshot.IsFailure = terminalFailure;
+            snapshot.IsSuccess = terminalSuccess;
+            snapshot.FilesDone = filesDone;
+            snapshot.EstimatedFiles = Math.Max(0, estimatedFiles);
+            snapshot.BytesDone = bytesDone;
+            snapshot.EstimatedBytes = Math.Max(0, estimatedBytes);
+            snapshot.StoredBytes = Math.Max(0, GetLong(summary, "data_added_packed", 0));
+            snapshot.TransferRateBytesPerSecond = elapsedForRate > 0
+                ? bytesDone / elapsedForRate
+                : 0;
+            snapshot.Elapsed = SafeTimeSpan(wrapperElapsed);
+            snapshot.ErrorCount = Math.Max(
+                SafeInt(GetLong(document, "error_count", 0)),
+                GetCollectionCount(document, "errors"));
+            snapshot.PhaseIndex = phase.Index;
+            snapshot.PhaseLabel = phase.PhaseLabel;
+            snapshot.LastUpdatedLocal = ToLocalOrNow(lastWriteUtc);
+            snapshot.RunId = GetString(document, "run_id", string.Empty);
+
+            if (terminalSuccess)
+            {
+                snapshot.Percent = 1;
+                snapshot.ProgressIsEstimated = false;
+                snapshot.ConfidenceLabel = "Final run result";
+            }
+            else if (terminalFailure)
+            {
+                snapshot.Percent = OverallPercent(phase.Stage, backupFraction);
+                snapshot.ProgressIsEstimated = true;
+                snapshot.ConfidenceLabel = interrupted
+                    ? "Last recorded progress before interruption"
+                    : "Last recorded progress before failure";
+            }
+            else
+            {
+                snapshot.Percent = OverallPercent(phase.Stage, backupFraction);
+                snapshot.ProgressIsEstimated = phase.Stage != 1 || !exactProgress;
+                snapshot.ConfidenceLabel = BuildConfidenceLabel(
+                    exactProgress && phase.Stage == 1,
+                    baseline);
+            }
+
+            if (active)
+            {
+                double? etaSeconds = EstimateEtaSeconds(
+                    document,
+                    progress,
+                    phase.Stage,
+                    backupFraction,
+                    filesDone,
+                    estimatedFiles,
+                    bytesDone,
+                    estimatedBytes,
+                    elapsedForRate,
+                    wrapperElapsed,
+                    baseline);
+                if (etaSeconds.HasValue)
+                {
+                    snapshot.Eta = SafeTimeSpan(etaSeconds.Value);
+                    snapshot.EstimatedCompletion = DateTime.Now.Add(snapshot.Eta.Value);
+                }
+            }
+
+            snapshot.StatusDetail = BuildStatusDetail(snapshot, document);
+            return snapshot;
+        }
+
+        private string BuildStatusDetail(
+            TelemetrySnapshot snapshot,
+            IDictionary<string, object> document)
+        {
+            if (snapshot.StateKey == "interrupted")
+            {
+                return "The protected status stopped updating and its backup process is no longer running or no longer matches this status; no completed result was recorded.";
+            }
+            if (snapshot.StateKey == "success")
+            {
+                return "Verified " + TelemetryFormat.FormatCount(snapshot.FilesDone)
+                    + " files; " + TelemetryFormat.FormatBytes(snapshot.StoredBytes)
+                    + " added to the repository.";
+            }
+            if (snapshot.StateKey == "success_unchanged")
+            {
+                return "All protected files already matched the latest verified snapshot.";
+            }
+            if (snapshot.IsFailure)
+            {
+                string failure = GetString(document, "failure", string.Empty);
+                if (!string.IsNullOrEmpty(failure))
+                {
+                    return CleanDisplayText(failure, 240);
+                }
+                return snapshot.ErrorCount > 0
+                    ? TelemetryFormat.FormatCount(snapshot.ErrorCount) + " errors were recorded during this run."
+                    : "The backup stopped before verification completed.";
+            }
+            if (snapshot.StateKey == "backing_up")
+            {
+                string detail = TelemetryFormat.FormatCount(snapshot.FilesDone) + " files \u2022 "
+                    + TelemetryFormat.FormatBytes(snapshot.BytesDone) + " read";
+                if (snapshot.TransferRateBytesPerSecond > 0)
+                {
+                    detail += " \u2022 "
+                        + TelemetryFormat.FormatBytes((long)snapshot.TransferRateBytesPerSecond)
+                        + "/s";
+                }
+                return detail;
+            }
+            if (snapshot.StateKey == "starting")
+            {
+                return "Validating the repository and preparing the protected source list.";
+            }
+            if (snapshot.StateKey == "verifying_snapshot")
+            {
+                return "Confirming that the new snapshot is present and correctly bound to this computer.";
+            }
+            if (snapshot.StateKey == "checking_repository")
+            {
+                return "Checking repository structure before the run is marked successful.";
+            }
+            if (snapshot.StateKey == "restoring_canary")
+            {
+                return "Restoring and hashing the canary file to prove recovery works.";
+            }
+            if (snapshot.StateKey == "checking_data_subset")
+            {
+                return "Reading this run's scheduled repository-data sample.";
+            }
+            return "Backup telemetry was received; the current phase is not yet classified.";
+        }
+
+        private static string BuildSourceFingerprint(IDictionary<string, object> document)
+        {
+            List<string> normalizedSources = GetCollection(document, "sources")
+                .Select(item => Convert.ToString(item, CultureInfo.InvariantCulture))
+                .Where(item => !string.IsNullOrWhiteSpace(item))
+                .Select(NormalizeFingerprintValue)
+                .OrderBy(item => item, StringComparer.Ordinal)
+                .ToList();
+            string canonical = "v1\n"
+                + NormalizeFingerprintValue(GetString(document, "repository", string.Empty)) + "\n"
+                + NormalizeFingerprintValue(GetString(document, "repository_volume_serial", string.Empty)) + "\n"
+                + NormalizeFingerprintValue(GetString(document, "exclude_file_sha256", string.Empty)) + "\n"
+                + string.Join("\n", normalizedSources.ToArray());
+            using (SHA256 sha256 = SHA256.Create())
+            {
+                byte[] hash = sha256.ComputeHash(Encoding.UTF8.GetBytes(canonical));
+                StringBuilder result = new StringBuilder(hash.Length * 2);
+                foreach (byte value in hash)
+                {
+                    result.Append(value.ToString("x2", CultureInfo.InvariantCulture));
+                }
+                return result.ToString();
+            }
+        }
+
+        private static string NormalizeFingerprintValue(string value)
+        {
+            return (value ?? string.Empty)
+                .Trim()
+                .Replace('/', '\\')
+                .TrimEnd('\\')
+                .ToUpperInvariant();
+        }
+
+        private EstimateBaseline BuildBaseline(string currentRunId, string sourceFingerprint)
+        {
+            List<RunMetricRecord> backups = historyRecords
+                .Where(item => item.Success
+                    && item.TypeKey == "backup"
+                    && string.Equals(item.SourceFingerprint, sourceFingerprint, StringComparison.Ordinal)
+                    && !string.Equals(item.RunId, currentRunId, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(item => item.StartedUtc)
+                .Take(20)
+                .ToList();
+            List<RunMetricRecord> source = backups;
+            bool dryRunOnly = false;
+            if (source.Count == 0)
+            {
+                source = historyRecords
+                    .Where(item => item.Success
+                        && item.TypeKey == "dry_run"
+                        && string.Equals(item.SourceFingerprint, sourceFingerprint, StringComparison.Ordinal))
+                    .OrderByDescending(item => item.StartedUtc)
+                    .Take(5)
+                    .ToList();
+                dryRunOnly = source.Count > 0;
+            }
+
+            EstimateBaseline baseline = new EstimateBaseline();
+            baseline.SampleCount = source.Count;
+            baseline.DryRunOnly = dryRunOnly;
+            baseline.Files = MedianLong(source.Where(item => item.Files > 0).Select(item => item.Files));
+            baseline.Bytes = MedianLong(source.Where(item => item.ProcessedBytes > 0).Select(item => item.ProcessedBytes));
+            baseline.TotalDurationSeconds = Median(
+                source.Where(item => item.DurationSeconds > 0)
+                    .Select(item => item.DurationSeconds));
+            baseline.ResticDurationSeconds = Median(
+                source.Where(item => item.ResticDurationSeconds > 0)
+                    .Select(item => item.ResticDurationSeconds));
+            if (baseline.ResticDurationSeconds <= 0)
+            {
+                baseline.ResticDurationSeconds = baseline.TotalDurationSeconds;
+            }
+
+            List<double> overheads = backups
+                .Where(item => item.DurationSeconds > item.ResticDurationSeconds
+                    && item.ResticDurationSeconds > 0)
+                .Select(item => item.DurationSeconds - item.ResticDurationSeconds)
+                .ToList();
+            baseline.PostProcessingSeconds = overheads.Count > 0 ? Median(overheads) : 240;
+            if (dryRunOnly)
+            {
+                baseline.TotalDurationSeconds += baseline.PostProcessingSeconds;
+            }
+            return baseline;
+        }
+
+        private double? EstimateEtaSeconds(
+            IDictionary<string, object> document,
+            IDictionary<string, object> progress,
+            int phaseIndex,
+            double backupFraction,
+            long filesDone,
+            long estimatedFiles,
+            long bytesDone,
+            long estimatedBytes,
+            double resticElapsed,
+            double wrapperElapsed,
+            EstimateBaseline baseline)
+        {
+            if (phaseIndex == 1)
+            {
+                List<double> candidates = new List<double>();
+                double exactRemaining = GetDouble(progress, "seconds_remaining", -1);
+                if (exactRemaining >= 0)
+                {
+                    candidates.Add(exactRemaining);
+                }
+                if (resticElapsed > 1 && filesDone > 0 && estimatedFiles > filesDone)
+                {
+                    candidates.Add((estimatedFiles - filesDone) / (filesDone / resticElapsed));
+                }
+                if (resticElapsed > 1 && bytesDone > 0 && estimatedBytes > bytesDone)
+                {
+                    candidates.Add((estimatedBytes - bytesDone) / (bytesDone / resticElapsed));
+                }
+                if (resticElapsed > 1 && backupFraction > 0.002 && backupFraction < 1)
+                {
+                    candidates.Add(resticElapsed * (1 - backupFraction) / backupFraction);
+                }
+                if (candidates.Count == 0 && baseline.ResticDurationSeconds > resticElapsed)
+                {
+                    candidates.Add(baseline.ResticDurationSeconds - resticElapsed);
+                }
+                if (candidates.Count == 0)
+                {
+                    return null;
+                }
+                return Clamp(Median(candidates) + baseline.PostProcessingSeconds, 0, MaximumEtaSeconds);
+            }
+
+            if (phaseIndex == 0)
+            {
+                double expected = baseline.TotalDurationSeconds;
+                return expected > wrapperElapsed
+                    ? (double?)Clamp(expected - wrapperElapsed, 0, MaximumEtaSeconds)
+                    : null;
+            }
+
+            List<double> historicDurations = historyRecords
+                .Where(item => item.Success
+                    && item.TypeKey == "backup"
+                    && item.DurationSeconds > 0
+                    && !string.Equals(item.RunId, GetString(document, "run_id", string.Empty),
+                        StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(item => item.StartedUtc)
+                .Take(20)
+                .Select(item => item.DurationSeconds)
+                .ToList();
+            if (historicDurations.Count > 0)
+            {
+                double historicRemaining = Median(historicDurations) - wrapperElapsed;
+                if (historicRemaining > 0)
+                {
+                    return Clamp(historicRemaining, 0, MaximumEtaSeconds);
+                }
+            }
+
+            double fallback;
+            switch (phaseIndex)
+            {
+                case 2:
+                    fallback = 90;
+                    break;
+                case 3:
+                    fallback = 300;
+                    break;
+                case 4:
+                    fallback = 45;
+                    break;
+                case 5:
+                    fallback = 600;
+                    break;
+                default:
+                    return null;
+            }
+            return fallback;
+        }
+
+        private string BuildConfidenceLabel(bool exactProgress, EstimateBaseline baseline)
+        {
+            if (exactProgress)
+            {
+                return "Restic-reported progress";
+            }
+            if (baseline.DryRunOnly)
+            {
+                return "Estimated from verified dry run";
+            }
+            if (baseline.SampleCount >= 5)
+            {
+                return "High-confidence median of recent runs";
+            }
+            if (baseline.SampleCount > 0)
+            {
+                return "Estimated from run history";
+            }
+            return "Learning from this run";
+        }
+
+        private static double OverallPercent(int phaseIndex, double backupFraction)
+        {
+            switch (phaseIndex)
+            {
+                case 0:
+                    return 0.015;
+                case 1:
+                    return Clamp(0.04 + 0.72 * backupFraction, 0.04, 0.75);
+                case 2:
+                    return 0.80;
+                case 3:
+                    return 0.86;
+                case 4:
+                    return 0.94;
+                case 5:
+                    return 0.97;
+                case 6:
+                    return 1;
+                default:
+                    return 0;
+            }
+        }
+
+        private static PhaseInfo GetPhase(string state)
+        {
+            switch (state)
+            {
+                case "starting":
+                    return new PhaseInfo(0, 0, "Preparing", "Preparing backup");
+                case "backing_up":
+                    return new PhaseInfo(0, 1, "Backing up", "Backing up files");
+                case "verifying_snapshot":
+                    return new PhaseInfo(1, 2, "Snapshot", "Confirming snapshot");
+                case "checking_repository":
+                    return new PhaseInfo(2, 3, "Repository", "Checking repository");
+                case "restoring_canary":
+                    return new PhaseInfo(3, 4, "Recovery test", "Testing recovery");
+                case "checking_data_subset":
+                    return new PhaseInfo(3, 5, "Data sample", "Reading repository data");
+                case "success":
+                    return new PhaseInfo(4, 6, "Complete", "Backup complete");
+                case "success_unchanged":
+                    return new PhaseInfo(4, 6, "Complete", "Everything is up to date");
+                default:
+                    return new PhaseInfo(-1, -1, "Unknown", "Checking backup status");
+            }
+        }
+
+        private static PhaseInfo InferFailurePhase(
+            IDictionary<string, object> document,
+            string state)
+        {
+            long backupExitCode = GetLong(document, "backup_exit_code", -1);
+            if (state == "partial" || backupExitCode > 0)
+            {
+                return new PhaseInfo(0, 1, "Backing up", "Backup incomplete");
+            }
+            if (backupExitCode < 0)
+            {
+                return new PhaseInfo(0, 0, "Preparing", "Backup failed while preparing");
+            }
+
+            string snapshotId = GetString(document, "snapshot_id", string.Empty);
+            if (string.IsNullOrEmpty(snapshotId))
+            {
+                return new PhaseInfo(1, 2, "Snapshot", "Snapshot verification failed");
+            }
+
+            IDictionary<string, object> verification = GetDictionary(document, "verification");
+            if (!GetBool(verification, "repository_structure", false))
+            {
+                return new PhaseInfo(2, 3, "Repository", "Repository verification failed");
+            }
+
+            IDictionary<string, object> canary = GetDictionary(verification, "canary");
+            if (!GetBool(canary, "verified", false))
+            {
+                return new PhaseInfo(3, 4, "Recovery test", "Recovery test failed");
+            }
+            if (!string.IsNullOrEmpty(GetString(verification, "data_subset", string.Empty)))
+            {
+                return new PhaseInfo(3, 5, "Data sample", "Repository data check failed");
+            }
+            return new PhaseInfo(3, 4, "Verification", "Backup verification failed");
+        }
+
+        private static bool IsStaleActiveStatus(
+            IDictionary<string, object> document,
+            DateTime startedUtc,
+            bool hasStarted,
+            DateTime lastWriteUtc)
+        {
+            DateTime nowUtc = DateTime.UtcNow;
+            double statusAgeSeconds = lastWriteUtc == DateTime.MinValue
+                ? MaximumActiveStatusAgeSeconds + 1
+                : Math.Max(0, (nowUtc - lastWriteUtc).TotalSeconds);
+            if (statusAgeSeconds > MaximumActiveStatusAgeSeconds)
+            {
+                return true;
+            }
+
+            if (hasStarted)
+            {
+                DateTime bootUtc = nowUtc - TimeSpan.FromMilliseconds(GetTickCount64());
+                if (startedUtc < bootUtc.AddMinutes(-2))
+                {
+                    return true;
+                }
+            }
+
+            long processIdValue = GetLong(document, "wrapper_pid", -1);
+            if (processIdValue <= 0 || processIdValue > int.MaxValue)
+            {
+                return statusAgeSeconds > MissingProcessGraceSeconds;
+            }
+
+            try
+            {
+                using (Process process = Process.GetProcessById((int)processIdValue))
+                {
+                    if (process.HasExited)
+                    {
+                        return statusAgeSeconds > MissingProcessGraceSeconds;
+                    }
+                    if (hasStarted)
+                    {
+                        try
+                        {
+                            DateTime processStartUtc = process.StartTime.ToUniversalTime();
+                            if (Math.Abs((processStartUtc - startedUtc).TotalMinutes) > 5)
+                            {
+                                return statusAgeSeconds > MissingProcessGraceSeconds;
+                            }
+                        }
+                        catch (System.ComponentModel.Win32Exception)
+                        {
+                        }
+                        catch (InvalidOperationException)
+                        {
+                            return statusAgeSeconds > MissingProcessGraceSeconds;
+                        }
+                    }
+                    return false;
+                }
+            }
+            catch (ArgumentException)
+            {
+                return statusAgeSeconds > MissingProcessGraceSeconds;
+            }
+            catch (InvalidOperationException)
+            {
+                return statusAgeSeconds > MissingProcessGraceSeconds;
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                return false;
+            }
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern ulong GetTickCount64();
+
+        private bool CaptureLiveSample(TelemetrySnapshot snapshot)
+        {
+            if (string.IsNullOrEmpty(snapshot.RunId)
+                || snapshot.StateKey == "ready"
+                || snapshot.StateKey == "waiting"
+                || snapshot.StateKey == "telemetry_error")
+            {
+                return false;
+            }
+
+            DateTime nowUtc = DateTime.UtcNow;
+            LiveSampleRecord last = liveSamples
+                .Where(item => string.Equals(item.RunId, snapshot.RunId,
+                    StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(item => item.SampledUtc)
+                .FirstOrDefault();
+            if (snapshot.IsActive)
+            {
+                if (last != null && (nowUtc - last.SampledUtc).TotalSeconds < 10)
+                {
+                    return false;
+                }
+            }
+            else if (last != null && last.Terminal)
+            {
+                return false;
+            }
+
+            LiveSampleRecord sample = new LiveSampleRecord();
+            sample.RunId = snapshot.RunId;
+            sample.SampledUtc = nowUtc;
+            sample.StateKey = snapshot.StateKey;
+            sample.PhaseIndex = snapshot.PhaseIndex;
+            sample.Percent = Clamp(snapshot.Percent, 0, 1);
+            sample.Estimated = snapshot.ProgressIsEstimated;
+            sample.FilesDone = Math.Max(0, snapshot.FilesDone);
+            sample.BytesDone = Math.Max(0, snapshot.BytesDone);
+            sample.StoredBytes = Math.Max(0, snapshot.StoredBytes);
+            sample.ElapsedSeconds = Math.Max(0, snapshot.Elapsed.TotalSeconds);
+            sample.EtaSeconds = snapshot.Eta.HasValue
+                ? Math.Max(0, snapshot.Eta.Value.TotalSeconds)
+                : -1;
+            sample.ErrorCount = Math.Max(0, snapshot.ErrorCount);
+            sample.Terminal = !snapshot.IsActive;
+            liveSamples.Add(sample);
+            TrimLiveSamples();
+            return true;
+        }
+
+        private bool UpsertMetric(RunMetricRecord candidate)
+        {
+            RunMetricRecord existing = historyRecords.FirstOrDefault(item =>
+                string.Equals(item.RunId, candidate.RunId, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.TypeKey, candidate.TypeKey, StringComparison.Ordinal));
+            if (existing != null)
+            {
+                if (MetricEquals(existing, candidate))
+                {
+                    return false;
+                }
+                historyRecords.Remove(existing);
+            }
+            historyRecords.Add(candidate);
+            historyRecords = historyRecords
+                .OrderByDescending(item => item.StartedUtc)
+                .Take(MaximumHistoryRuns)
+                .ToList();
+            return true;
+        }
+
+        private static bool MetricEquals(RunMetricRecord left, RunMetricRecord right)
+        {
+            return left.RunId == right.RunId
+                && left.TypeKey == right.TypeKey
+                && left.StateKey == right.StateKey
+                && left.Success == right.Success
+                && left.StartedUtc == right.StartedUtc
+                && left.FinishedUtc == right.FinishedUtc
+                && Math.Abs(left.DurationSeconds - right.DurationSeconds) < 0.001
+                && Math.Abs(left.ResticDurationSeconds - right.ResticDurationSeconds) < 0.001
+                && left.Files == right.Files
+                && left.ProcessedBytes == right.ProcessedBytes
+                && left.StoredBytes == right.StoredBytes
+                && left.SnapshotId == right.SnapshotId
+                && left.SourceFingerprint == right.SourceFingerprint;
+        }
+
+        private RunMetricRecord CreateBackupMetric(IDictionary<string, object> document)
+        {
+            string state = GetString(document, "state", string.Empty).ToLowerInvariant();
+            if (state != "success" && state != "success_unchanged"
+                && state != "failed" && state != "partial")
+            {
+                return null;
+            }
+            return CreateMetric(document, "backup", state,
+                state == "success" || state == "success_unchanged");
+        }
+
+        private RunMetricRecord CreateDryRunMetric(IDictionary<string, object> document)
+        {
+            string state = GetString(document, "state", string.Empty).ToLowerInvariant();
+            if (state != "clean" && state != "source_errors" && state != "failed")
+            {
+                return null;
+            }
+            return CreateMetric(document, "dry_run", state, state == "clean");
+        }
+
+        private RunMetricRecord CreateMetric(
+            IDictionary<string, object> document,
+            string typeKey,
+            string stateKey,
+            bool success)
+        {
+            string runId = CleanIdentifier(GetString(document, "run_id", string.Empty), 100);
+            DateTime startedUtc;
+            if (string.IsNullOrEmpty(runId) || !TryGetUtc(document, "started_utc", out startedUtc))
+            {
+                return null;
+            }
+            DateTime finishedUtc;
+            bool hasFinished = TryGetUtc(document, "finished_utc", out finishedUtc);
+            IDictionary<string, object> summary = GetDictionary(document, "summary");
+            IDictionary<string, object> progress = GetDictionary(document, "progress");
+
+            RunMetricRecord metric = new RunMetricRecord();
+            metric.RunId = runId;
+            metric.TypeKey = typeKey;
+            metric.StateKey = stateKey;
+            metric.Success = success;
+            metric.SourceFingerprint = BuildSourceFingerprint(document);
+            metric.StartedUtc = startedUtc;
+            metric.FinishedUtc = hasFinished ? finishedUtc : startedUtc;
+            metric.DurationSeconds = hasFinished
+                ? Clamp((finishedUtc - startedUtc).TotalSeconds, 0, MaximumEtaSeconds * 2)
+                : Math.Max(0, GetDouble(summary, "total_duration", 0));
+            metric.ResticDurationSeconds = Math.Max(0,
+                GetDouble(summary, "total_duration", 0));
+            metric.Files = Math.Max(0, FirstNonNegative(
+                GetLong(summary, "total_files_processed", -1),
+                GetLong(progress, "files_done", 0)));
+            metric.ProcessedBytes = Math.Max(0, FirstNonNegative(
+                GetLong(summary, "total_bytes_processed", -1),
+                GetLong(progress, "bytes_done", 0)));
+            metric.StoredBytes = Math.Max(0, FirstNonNegative(
+                GetLong(summary, "data_added_packed", -1),
+                GetLong(summary, "data_added", 0)));
+            metric.SnapshotId = CleanIdentifier(
+                FirstNonEmpty(
+                    GetString(document, "snapshot_id", string.Empty),
+                    GetString(summary, "snapshot_id", string.Empty)),
+                128);
+            return metric;
+        }
+
+        private IList<RunMetricView> BuildHistoryViews()
+        {
+            return historyRecords
+                .OrderByDescending(item => item.StartedUtc)
+                .Select(item => new RunMetricView
+                {
+                    StartedLocal = item.StartedUtc.ToLocalTime(),
+                    RunId = item.RunId,
+                    TypeLabel = item.TypeKey == "dry_run" ? "Dry run" : "Backup",
+                    StateLabel = MetricStateLabel(item.StateKey),
+                    Success = item.Success,
+                    DurationSeconds = item.DurationSeconds,
+                    Files = item.Files,
+                    ProcessedBytes = item.ProcessedBytes,
+                    StoredBytes = item.StoredBytes,
+                    SnapshotShort = ShortSnapshot(item.SnapshotId)
+                })
+                .ToList();
+        }
+
+        private static string MetricStateLabel(string state)
+        {
+            switch (state)
+            {
+                case "success":
+                    return "Verified";
+                case "success_unchanged":
+                    return "Unchanged";
+                case "clean":
+                    return "Clean baseline";
+                case "partial":
+                    return "Incomplete";
+                case "source_errors":
+                    return "Source errors";
+                case "failed":
+                    return "Failed";
+                default:
+                    return state;
+            }
+        }
+
+        private void TryPersistHistory()
+        {
+            if (!persistenceReady)
+            {
+                return;
+            }
+            Dictionary<string, object> root = new Dictionary<string, object>();
+            root["schema_version"] = 1;
+            root["updated_utc"] = FormatUtc(DateTime.UtcNow);
+            root["runs"] = historyRecords.Select(SerializeMetric).ToList();
+            TryAtomicWriteJson(historyPath, root);
+        }
+
+        private void TryPersistLiveSamples()
+        {
+            if (!persistenceReady)
+            {
+                return;
+            }
+            Dictionary<string, object> root = new Dictionary<string, object>();
+            root["schema_version"] = 1;
+            root["sample_interval_seconds"] = 10;
+            root["updated_utc"] = FormatUtc(DateTime.UtcNow);
+            root["samples"] = liveSamples.Select(SerializeLiveSample).ToList();
+            TryAtomicWriteJson(liveSamplesPath, root);
+        }
+
+        private Dictionary<string, object> SerializeMetric(RunMetricRecord metric)
+        {
+            Dictionary<string, object> value = new Dictionary<string, object>();
+            value["run_id"] = metric.RunId;
+            value["type"] = metric.TypeKey;
+            value["state"] = metric.StateKey;
+            value["success"] = metric.Success;
+            value["started_utc"] = FormatUtc(metric.StartedUtc);
+            value["finished_utc"] = FormatUtc(metric.FinishedUtc);
+            value["duration_seconds"] = metric.DurationSeconds;
+            value["restic_duration_seconds"] = metric.ResticDurationSeconds;
+            value["files"] = metric.Files;
+            value["processed_bytes"] = metric.ProcessedBytes;
+            value["stored_bytes"] = metric.StoredBytes;
+            value["snapshot_id"] = metric.SnapshotId;
+            value["source_fingerprint"] = metric.SourceFingerprint;
+            return value;
+        }
+
+        private Dictionary<string, object> SerializeLiveSample(LiveSampleRecord sample)
+        {
+            Dictionary<string, object> value = new Dictionary<string, object>();
+            value["run_id"] = sample.RunId;
+            value["sampled_utc"] = FormatUtc(sample.SampledUtc);
+            value["state"] = sample.StateKey;
+            value["phase_index"] = sample.PhaseIndex;
+            value["percent"] = sample.Percent;
+            value["estimated"] = sample.Estimated;
+            value["files_done"] = sample.FilesDone;
+            value["bytes_done"] = sample.BytesDone;
+            value["stored_bytes"] = sample.StoredBytes;
+            value["elapsed_seconds"] = sample.ElapsedSeconds;
+            value["eta_seconds"] = sample.EtaSeconds;
+            value["error_count"] = sample.ErrorCount;
+            value["terminal"] = sample.Terminal;
+            return value;
+        }
+
+        private List<RunMetricRecord> ParseHistory(IDictionary<string, object> root)
+        {
+            List<RunMetricRecord> result = new List<RunMetricRecord>();
+            foreach (object item in GetCollection(root, "runs"))
+            {
+                IDictionary<string, object> value = item as IDictionary<string, object>;
+                if (value == null)
+                {
+                    continue;
+                }
+
+                string runId = CleanIdentifier(GetString(value, "run_id", string.Empty), 100);
+                string type = GetString(value, "type", string.Empty);
+                string state = CleanIdentifier(GetString(value, "state", string.Empty), 50);
+                DateTime startedUtc;
+                DateTime finishedUtc;
+                if (string.IsNullOrEmpty(runId)
+                    || (type != "backup" && type != "dry_run")
+                    || !TryGetUtc(value, "started_utc", out startedUtc))
+                {
+                    continue;
+                }
+                if (!TryGetUtc(value, "finished_utc", out finishedUtc))
+                {
+                    finishedUtc = startedUtc;
+                }
+
+                RunMetricRecord metric = new RunMetricRecord();
+                metric.RunId = runId;
+                metric.TypeKey = type;
+                metric.StateKey = state;
+                metric.Success = GetBool(value, "success", false);
+                metric.StartedUtc = startedUtc;
+                metric.FinishedUtc = finishedUtc;
+                metric.DurationSeconds = Clamp(
+                    GetDouble(value, "duration_seconds", 0), 0, MaximumEtaSeconds * 2);
+                metric.ResticDurationSeconds = Clamp(
+                    GetDouble(value, "restic_duration_seconds", 0), 0, MaximumEtaSeconds * 2);
+                metric.Files = Math.Max(0, GetLong(value, "files", 0));
+                metric.ProcessedBytes = Math.Max(0, GetLong(value, "processed_bytes", 0));
+                metric.StoredBytes = Math.Max(0, GetLong(value, "stored_bytes", 0));
+                metric.SnapshotId = CleanIdentifier(
+                    GetString(value, "snapshot_id", string.Empty), 128);
+                metric.SourceFingerprint = CleanIdentifier(
+                    GetString(value, "source_fingerprint", string.Empty), 128);
+                result.Add(metric);
+            }
+
+            return result
+                .GroupBy(item => item.TypeKey + "\n" + item.RunId,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.OrderByDescending(item => item.FinishedUtc).First())
+                .OrderByDescending(item => item.StartedUtc)
+                .Take(MaximumHistoryRuns)
+                .ToList();
+        }
+
+        private List<LiveSampleRecord> ParseLiveSamples(IDictionary<string, object> root)
+        {
+            List<LiveSampleRecord> result = new List<LiveSampleRecord>();
+            foreach (object item in GetCollection(root, "samples"))
+            {
+                IDictionary<string, object> value = item as IDictionary<string, object>;
+                if (value == null)
+                {
+                    continue;
+                }
+                string runId = CleanIdentifier(GetString(value, "run_id", string.Empty), 100);
+                DateTime sampledUtc;
+                if (string.IsNullOrEmpty(runId)
+                    || !TryGetUtc(value, "sampled_utc", out sampledUtc))
+                {
+                    continue;
+                }
+
+                LiveSampleRecord sample = new LiveSampleRecord();
+                sample.RunId = runId;
+                sample.SampledUtc = sampledUtc;
+                sample.StateKey = CleanIdentifier(GetString(value, "state", "unknown"), 50);
+                sample.PhaseIndex = SafeInt(GetLong(value, "phase_index", -1));
+                sample.Percent = Clamp(GetDouble(value, "percent", 0), 0, 1);
+                sample.Estimated = GetBool(value, "estimated", true);
+                sample.FilesDone = Math.Max(0, GetLong(value, "files_done", 0));
+                sample.BytesDone = Math.Max(0, GetLong(value, "bytes_done", 0));
+                sample.StoredBytes = Math.Max(0, GetLong(value, "stored_bytes", 0));
+                sample.ElapsedSeconds = Clamp(
+                    GetDouble(value, "elapsed_seconds", 0), 0, MaximumEtaSeconds * 2);
+                sample.EtaSeconds = Clamp(
+                    GetDouble(value, "eta_seconds", -1), -1, MaximumEtaSeconds);
+                sample.ErrorCount = Math.Max(0, SafeInt(GetLong(value, "error_count", 0)));
+                sample.Terminal = GetBool(value, "terminal", false);
+                result.Add(sample);
+            }
+            result = result.OrderBy(item => item.SampledUtc).ToList();
+            if (result.Count > MaximumLiveSamples)
+            {
+                result = result.Skip(result.Count - MaximumLiveSamples).ToList();
+            }
+            return result;
+        }
+
+        private void TrimLiveSamples()
+        {
+            liveSamples = liveSamples.OrderBy(item => item.SampledUtc).ToList();
+            if (liveSamples.Count > MaximumLiveSamples)
+            {
+                liveSamples = liveSamples.Skip(liveSamples.Count - MaximumLiveSamples).ToList();
+            }
+        }
+
+        private void TryAtomicWriteJson(string targetPath, object value)
+        {
+            if (!persistenceReady || string.IsNullOrEmpty(targetPath))
+            {
+                return;
+            }
+
+            string targetFullPath;
+            try
+            {
+                targetFullPath = Path.GetFullPath(targetPath);
+                string parent = TrimTrailingSeparators(Path.GetDirectoryName(targetFullPath));
+                if (!string.Equals(parent, TrimTrailingSeparators(dashboardDirectory),
+                    StringComparison.OrdinalIgnoreCase)
+                    || IsPathInside(targetFullPath, stateDirectory)
+                    || (File.GetAttributes(dashboardDirectory) & FileAttributes.ReparsePoint) != 0)
+                {
+                    persistenceReady = false;
+                    return;
+                }
+            }
+            catch (Exception error)
+            {
+                if (IsExpectedIoException(error))
+                {
+                    persistenceReady = false;
+                    return;
+                }
+                throw;
+            }
+
+            string temporaryPath = Path.Combine(
+                dashboardDirectory,
+                "." + Path.GetFileName(targetFullPath) + "."
+                    + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                string json = serializer.Serialize(value);
+                byte[] bytes = new UTF8Encoding(false).GetBytes(json);
+                using (FileStream stream = new FileStream(
+                    temporaryPath,
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None,
+                    4096,
+                    FileOptions.WriteThrough))
+                {
+                    stream.Write(bytes, 0, bytes.Length);
+                    stream.Flush(true);
+                }
+
+                if (File.Exists(targetFullPath))
+                {
+                    File.Replace(temporaryPath, targetFullPath, null, true);
+                }
+                else
+                {
+                    try
+                    {
+                        File.Move(temporaryPath, targetFullPath);
+                    }
+                    catch (IOException)
+                    {
+                        if (!File.Exists(targetFullPath))
+                        {
+                            throw;
+                        }
+                        File.Replace(temporaryPath, targetFullPath, null, true);
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                if (!IsExpectedIoException(error))
+                {
+                    throw;
+                }
+            }
+            finally
+            {
+                try
+                {
+                    if (File.Exists(temporaryPath))
+                    {
+                        File.Delete(temporaryPath);
+                    }
+                }
+                catch (Exception error)
+                {
+                    if (!IsExpectedIoException(error))
+                    {
+                        throw;
+                    }
+                }
+            }
+        }
+
+        private JsonReadResult ReadJsonObject(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return JsonReadResult.Missing();
+            }
+
+            Exception lastError = null;
+            bool observedExisting = false;
+            for (int attempt = 0; attempt < 3; attempt++)
+            {
+                try
+                {
+                    if (!File.Exists(path))
+                    {
+                        return JsonReadResult.Missing();
+                    }
+                    observedExisting = true;
+                    FileAttributes attributes = File.GetAttributes(path);
+                    if ((attributes & FileAttributes.ReparsePoint) != 0)
+                    {
+                        return JsonReadResult.Invalid(true, 0, DateTime.MinValue,
+                            "Refusing to follow a reparse-point telemetry file.");
+                    }
+
+                    string json;
+                    long length;
+                    using (FileStream stream = new FileStream(
+                        path,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete))
+                    {
+                        length = stream.Length;
+                        if (length > MaximumJsonLength)
+                        {
+                            return JsonReadResult.Invalid(true, length, DateTime.MinValue,
+                                "Telemetry JSON exceeds the safety limit.");
+                        }
+                        using (StreamReader reader = new StreamReader(
+                            stream,
+                            new UTF8Encoding(false, true),
+                            true,
+                            4096,
+                            false))
+                        {
+                            json = reader.ReadToEnd();
+                        }
+                    }
+                    object parsed = serializer.DeserializeObject(json);
+                    IDictionary<string, object> document = parsed as IDictionary<string, object>;
+                    if (document == null)
+                    {
+                        return JsonReadResult.Invalid(true, length, DateTime.MinValue,
+                            "Telemetry JSON root is not an object.");
+                    }
+                    DateTime lastWriteUtc;
+                    try
+                    {
+                        lastWriteUtc = File.GetLastWriteTimeUtc(path);
+                    }
+                    catch (IOException)
+                    {
+                        lastWriteUtc = DateTime.MinValue;
+                    }
+                    return JsonReadResult.Valid(document, length, lastWriteUtc);
+                }
+                catch (Exception error)
+                {
+                    if (!IsExpectedReadException(error))
+                    {
+                        throw;
+                    }
+                    lastError = error;
+                    if (attempt < 2)
+                    {
+                        Thread.Sleep(15 * (attempt + 1));
+                    }
+                }
+            }
+
+            return JsonReadResult.Invalid(
+                observedExisting || File.Exists(path),
+                0,
+                DateTime.MinValue,
+                lastError == null ? "Telemetry could not be read." : lastError.Message);
+        }
+
+        private static bool TryGetResticPercent(
+            IDictionary<string, object> progress,
+            out double percent)
+        {
+            percent = 0;
+            if (progress == null || !progress.ContainsKey("percent_done"))
+            {
+                return false;
+            }
+            double value = GetDouble(progress, "percent_done", -1);
+            if (value > 1 && value <= 100)
+            {
+                value /= 100.0;
+            }
+            if (value <= 0 || value > 1 || double.IsNaN(value) || double.IsInfinity(value))
+            {
+                return false;
+            }
+            percent = value;
+            return true;
+        }
+
+        private static IDictionary<string, object> GetDictionary(
+            IDictionary<string, object> source,
+            string key)
+        {
+            if (source == null)
+            {
+                return null;
+            }
+            object value;
+            return source.TryGetValue(key, out value)
+                ? value as IDictionary<string, object>
+                : null;
+        }
+
+        private static IEnumerable<object> GetCollection(
+            IDictionary<string, object> source,
+            string key)
+        {
+            if (source == null)
+            {
+                return Enumerable.Empty<object>();
+            }
+            object value;
+            if (!source.TryGetValue(key, out value) || value == null || value is string)
+            {
+                return Enumerable.Empty<object>();
+            }
+            object[] array = value as object[];
+            if (array != null)
+            {
+                return array;
+            }
+            ArrayList list = value as ArrayList;
+            if (list != null)
+            {
+                return list.Cast<object>();
+            }
+            IEnumerable enumerable = value as IEnumerable;
+            return enumerable == null
+                ? Enumerable.Empty<object>()
+                : enumerable.Cast<object>();
+        }
+
+        private static int GetCollectionCount(
+            IDictionary<string, object> source,
+            string key)
+        {
+            return GetCollection(source, key).Take(100000).Count();
+        }
+
+        private static string GetString(
+            IDictionary<string, object> source,
+            string key,
+            string fallback)
+        {
+            if (source == null)
+            {
+                return fallback;
+            }
+            object value;
+            if (!source.TryGetValue(key, out value) || value == null)
+            {
+                return fallback;
+            }
+            string text = value as string;
+            return text ?? Convert.ToString(value, CultureInfo.InvariantCulture) ?? fallback;
+        }
+
+        private static long GetLong(
+            IDictionary<string, object> source,
+            string key,
+            long fallback)
+        {
+            if (source == null)
+            {
+                return fallback;
+            }
+            object value;
+            if (!source.TryGetValue(key, out value) || value == null)
+            {
+                return fallback;
+            }
+            try
+            {
+                if (value is double)
+                {
+                    double number = (double)value;
+                    if (double.IsNaN(number) || double.IsInfinity(number)
+                        || number > long.MaxValue || number < long.MinValue)
+                    {
+                        return fallback;
+                    }
+                    return (long)number;
+                }
+                if (value is decimal)
+                {
+                    decimal number = (decimal)value;
+                    if (number > long.MaxValue || number < long.MinValue)
+                    {
+                        return fallback;
+                    }
+                    return (long)number;
+                }
+                return Convert.ToInt64(value, CultureInfo.InvariantCulture);
+            }
+            catch (Exception error)
+            {
+                if (error is FormatException || error is InvalidCastException
+                    || error is OverflowException)
+                {
+                    return fallback;
+                }
+                throw;
+            }
+        }
+
+        private static double GetDouble(
+            IDictionary<string, object> source,
+            string key,
+            double fallback)
+        {
+            if (source == null)
+            {
+                return fallback;
+            }
+            object value;
+            if (!source.TryGetValue(key, out value) || value == null)
+            {
+                return fallback;
+            }
+            try
+            {
+                double number = Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                return double.IsNaN(number) || double.IsInfinity(number) ? fallback : number;
+            }
+            catch (Exception error)
+            {
+                if (error is FormatException || error is InvalidCastException
+                    || error is OverflowException)
+                {
+                    return fallback;
+                }
+                throw;
+            }
+        }
+
+        private static bool GetBool(
+            IDictionary<string, object> source,
+            string key,
+            bool fallback)
+        {
+            if (source == null)
+            {
+                return fallback;
+            }
+            object value;
+            if (!source.TryGetValue(key, out value) || value == null)
+            {
+                return fallback;
+            }
+            if (value is bool)
+            {
+                return (bool)value;
+            }
+            bool parsed;
+            return bool.TryParse(Convert.ToString(value, CultureInfo.InvariantCulture), out parsed)
+                ? parsed
+                : fallback;
+        }
+
+        private static bool TryGetUtc(
+            IDictionary<string, object> source,
+            string key,
+            out DateTime utc)
+        {
+            utc = DateTime.MinValue;
+            string value = GetString(source, key, string.Empty);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return false;
+            }
+            DateTimeOffset parsed;
+            if (!DateTimeOffset.TryParse(
+                value,
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                out parsed))
+            {
+                return false;
+            }
+            utc = parsed.UtcDateTime;
+            return true;
+        }
+
+        private static double DurationBetween(IDictionary<string, object> source)
+        {
+            DateTime start;
+            DateTime finish;
+            if (!TryGetUtc(source, "started_utc", out start)
+                || !TryGetUtc(source, "finished_utc", out finish))
+            {
+                return 0;
+            }
+            return Math.Max(0, (finish - start).TotalSeconds);
+        }
+
+        private static long MedianLong(IEnumerable<long> values)
+        {
+            List<long> sorted = values.OrderBy(value => value).ToList();
+            if (sorted.Count == 0)
+            {
+                return 0;
+            }
+            int middle = sorted.Count / 2;
+            if ((sorted.Count & 1) == 1)
+            {
+                return sorted[middle];
+            }
+            return (long)(((decimal)sorted[middle - 1] + sorted[middle]) / 2m);
+        }
+
+        private static double Median(IEnumerable<double> values)
+        {
+            List<double> sorted = values
+                .Where(value => !double.IsNaN(value) && !double.IsInfinity(value) && value >= 0)
+                .OrderBy(value => value)
+                .ToList();
+            if (sorted.Count == 0)
+            {
+                return 0;
+            }
+            int middle = sorted.Count / 2;
+            return (sorted.Count & 1) == 1
+                ? sorted[middle]
+                : (sorted[middle - 1] + sorted[middle]) / 2.0;
+        }
+
+        private static double Clamp(double value, double minimum, double maximum)
+        {
+            return Math.Max(minimum, Math.Min(maximum, value));
+        }
+
+        private static TimeSpan SafeTimeSpan(double seconds)
+        {
+            return TimeSpan.FromSeconds(Clamp(seconds, 0, MaximumEtaSeconds * 2));
+        }
+
+        private static int SafeInt(long value)
+        {
+            if (value > int.MaxValue)
+            {
+                return int.MaxValue;
+            }
+            if (value < int.MinValue)
+            {
+                return int.MinValue;
+            }
+            return (int)value;
+        }
+
+        private static long FirstNonNegative(long first, long second)
+        {
+            return first >= 0 ? first : Math.Max(0, second);
+        }
+
+        private static string FirstNonEmpty(string first, string second)
+        {
+            return string.IsNullOrEmpty(first) ? second : first;
+        }
+
+        private static string ShortSnapshot(string snapshotId)
+        {
+            if (string.IsNullOrEmpty(snapshotId))
+            {
+                return string.Empty;
+            }
+            return snapshotId.Length <= 8 ? snapshotId : snapshotId.Substring(0, 8);
+        }
+
+        private static string CleanIdentifier(string value, int maximumLength)
+        {
+            if (string.IsNullOrEmpty(value))
+            {
+                return string.Empty;
+            }
+            StringBuilder clean = new StringBuilder();
+            foreach (char character in value)
+            {
+                if (character >= 32 && character != 127)
+                {
+                    clean.Append(character);
+                }
+                if (clean.Length >= maximumLength)
+                {
+                    break;
+                }
+            }
+            return clean.ToString();
+        }
+
+        private static string CleanDisplayText(string value, int maximumLength)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return "No additional detail is available.";
+            }
+            string clean = value.Replace('\r', ' ').Replace('\n', ' ').Trim();
+            while (clean.Contains("  "))
+            {
+                clean = clean.Replace("  ", " ");
+            }
+            return clean.Length <= maximumLength
+                ? clean
+                : clean.Substring(0, Math.Max(0, maximumLength - 1)) + "\u2026";
+        }
+
+        private static string FormatUtc(DateTime value)
+        {
+            DateTime utc = value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime();
+            return utc.ToString("o", CultureInfo.InvariantCulture);
+        }
+
+        private static DateTime ToLocalOrNow(DateTime utc)
+        {
+            return utc == DateTime.MinValue ? DateTime.Now : utc.ToLocalTime();
+        }
+
+        private static string TrimTrailingSeparators(string path)
+        {
+            if (string.IsNullOrEmpty(path))
+            {
+                return path;
+            }
+            string root = Path.GetPathRoot(path);
+            while (path.Length > root.Length
+                && (path[path.Length - 1] == Path.DirectorySeparatorChar
+                    || path[path.Length - 1] == Path.AltDirectorySeparatorChar))
+            {
+                path = path.Substring(0, path.Length - 1);
+            }
+            return path;
+        }
+
+        private static bool PathsOverlap(string first, string second)
+        {
+            return IsPathInside(first, second) || IsPathInside(second, first);
+        }
+
+        private static bool IsPathInside(string candidate, string directory)
+        {
+            if (string.IsNullOrEmpty(candidate) || string.IsNullOrEmpty(directory))
+            {
+                return false;
+            }
+            string fullCandidate = TrimTrailingSeparators(Path.GetFullPath(candidate));
+            string fullDirectory = TrimTrailingSeparators(Path.GetFullPath(directory));
+            if (string.Equals(fullCandidate, fullDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+            return fullCandidate.StartsWith(
+                fullDirectory + Path.DirectorySeparatorChar,
+                StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsExpectedReadException(Exception error)
+        {
+            return IsExpectedIoException(error)
+                || error is InvalidOperationException
+                || error is FormatException;
+        }
+
+        private static bool IsExpectedIoException(Exception error)
+        {
+            return error is IOException
+                || error is UnauthorizedAccessException
+                || error is SecurityException
+                || error is NotSupportedException
+                || error is ArgumentException;
+        }
+    }
+
+    internal sealed class JsonReadResult
+    {
+        public bool Exists { get; private set; }
+        public IDictionary<string, object> Document { get; private set; }
+        public long Length { get; private set; }
+        public DateTime LastWriteUtc { get; private set; }
+        public string Error { get; private set; }
+
+        public static JsonReadResult Missing()
+        {
+            return new JsonReadResult
+            {
+                Exists = false,
+                Length = 0,
+                LastWriteUtc = DateTime.MinValue,
+                Error = string.Empty
+            };
+        }
+
+        public static JsonReadResult Valid(
+            IDictionary<string, object> document,
+            long length,
+            DateTime lastWriteUtc)
+        {
+            return new JsonReadResult
+            {
+                Exists = true,
+                Document = document,
+                Length = length,
+                LastWriteUtc = lastWriteUtc,
+                Error = string.Empty
+            };
+        }
+
+        public static JsonReadResult Invalid(
+            bool exists,
+            long length,
+            DateTime lastWriteUtc,
+            string error)
+        {
+            return new JsonReadResult
+            {
+                Exists = exists,
+                Length = length,
+                LastWriteUtc = lastWriteUtc,
+                Error = error ?? "Telemetry JSON is invalid."
+            };
+        }
+    }
+
+    internal sealed class PhaseInfo
+    {
+        public int Index { get; private set; }
+        public int Stage { get; private set; }
+        public string PhaseLabel { get; private set; }
+        public string StatusLabel { get; private set; }
+
+        public PhaseInfo(int index, int stage, string phaseLabel, string statusLabel)
+        {
+            Index = index;
+            Stage = stage;
+            PhaseLabel = phaseLabel;
+            StatusLabel = statusLabel;
+        }
+    }
+
+    internal sealed class EstimateBaseline
+    {
+        public int SampleCount { get; set; }
+        public bool DryRunOnly { get; set; }
+        public long Files { get; set; }
+        public long Bytes { get; set; }
+        public double TotalDurationSeconds { get; set; }
+        public double ResticDurationSeconds { get; set; }
+        public double PostProcessingSeconds { get; set; }
+    }
+
+    internal sealed class RunMetricRecord
+    {
+        public string RunId { get; set; }
+        public string TypeKey { get; set; }
+        public string StateKey { get; set; }
+        public bool Success { get; set; }
+        public DateTime StartedUtc { get; set; }
+        public DateTime FinishedUtc { get; set; }
+        public double DurationSeconds { get; set; }
+        public double ResticDurationSeconds { get; set; }
+        public long Files { get; set; }
+        public long ProcessedBytes { get; set; }
+        public long StoredBytes { get; set; }
+        public string SnapshotId { get; set; }
+        public string SourceFingerprint { get; set; }
+    }
+
+    internal sealed class LiveSampleRecord
+    {
+        public string RunId { get; set; }
+        public DateTime SampledUtc { get; set; }
+        public string StateKey { get; set; }
+        public int PhaseIndex { get; set; }
+        public double Percent { get; set; }
+        public bool Estimated { get; set; }
+        public long FilesDone { get; set; }
+        public long BytesDone { get; set; }
+        public long StoredBytes { get; set; }
+        public double ElapsedSeconds { get; set; }
+        public double EtaSeconds { get; set; }
+        public int ErrorCount { get; set; }
+        public bool Terminal { get; set; }
+    }
+}

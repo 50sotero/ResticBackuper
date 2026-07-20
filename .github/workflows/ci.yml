@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-safety-tests:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Compile Python sources
+        shell: pwsh
+        run: python -m compileall -q src tests
+
+      - name: Parse PowerShell without executing it
+        shell: pwsh
+        run: |
+          $hadErrors = $false
+          Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Recurse -File -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            )
+            foreach ($parseError in $errors) {
+              Write-Error "$($_.FullName):$($parseError.Extent.StartLineNumber): $($parseError.Message)" -ErrorAction Continue
+              $hadErrors = $true
+            }
+          }
+          if ($hadErrors) { exit 1 }
+
+      - name: Run isolated unit and repository-hygiene tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Build checksum-pinned Windows release
+        shell: pwsh
+        run: .\build\Build-Release.ps1
+
+      - name: Exercise two real snapshots and an independent restore
+        shell: pwsh
+        run: .\tests\Test-ReleaseArtifact.ps1

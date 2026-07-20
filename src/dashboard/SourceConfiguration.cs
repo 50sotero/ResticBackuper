@@ -1,0 +1,346 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Security.Principal;
+using System.Text;
+using System.Web.Script.Serialization;
+
+namespace ResticBackuper.Dashboard
+{
+    internal sealed class BackupSourceView
+    {
+        public string SourcePath { get; private set; }
+        public bool IsProtectedCanary { get; private set; }
+
+        public string RoleLabel
+        {
+            get { return IsProtectedCanary ? "Protected canary" : "Backed-up folder"; }
+        }
+
+        public BackupSourceView(string sourcePath, bool isProtectedCanary)
+        {
+            SourcePath = sourcePath;
+            IsProtectedCanary = isProtectedCanary;
+        }
+    }
+
+    internal sealed class SourceConfiguration
+    {
+        public string InstallRoot { get; private set; }
+        public string ConfigurationPath { get; private set; }
+        public string ManagerPath { get; private set; }
+        public IList<BackupSourceView> Sources { get; private set; }
+
+        private SourceConfiguration()
+        {
+        }
+
+        public static SourceConfiguration Load()
+        {
+            string installRoot = ResolveProtectedInstallRoot();
+            string configurationPath = Path.Combine(installRoot, "backup-config.json");
+            if (!File.Exists(configurationPath))
+            {
+                throw new FileNotFoundException(
+                    "The installed backup configuration was not found.",
+                    configurationPath);
+            }
+
+            FileInfo configurationFile = new FileInfo(configurationPath);
+            if (configurationFile.Length > 1024 * 1024)
+            {
+                throw new InvalidDataException("The backup configuration is unexpectedly large.");
+            }
+
+            string json = File.ReadAllText(configurationPath, Encoding.UTF8);
+            IDictionary<string, object> document =
+                new JavaScriptSerializer().DeserializeObject(json) as IDictionary<string, object>;
+            if (document == null)
+            {
+                throw new InvalidDataException("The backup configuration is not a JSON object.");
+            }
+
+            object sourceValue;
+            IEnumerable sourceItems = null;
+            if (document.TryGetValue("sources", out sourceValue) && !(sourceValue is string))
+            {
+                sourceItems = sourceValue as IEnumerable;
+            }
+            if (sourceItems == null)
+            {
+                throw new InvalidDataException("The backup configuration has no source folder list.");
+            }
+
+            string canaryDirectory = null;
+            object canaryValue;
+            if (document.TryGetValue("canary_file", out canaryValue) && canaryValue is string)
+            {
+                string canaryFile = (string)canaryValue;
+                if (Path.IsPathRooted(canaryFile))
+                {
+                    canaryDirectory = Path.GetDirectoryName(Path.GetFullPath(canaryFile));
+                }
+            }
+
+            List<BackupSourceView> sources = new List<BackupSourceView>();
+            HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (object item in sourceItems)
+            {
+                string source = item as string;
+                if (string.IsNullOrWhiteSpace(source) || !Path.IsPathRooted(source))
+                {
+                    throw new InvalidDataException("The backup configuration contains an invalid source path.");
+                }
+                string absoluteSource = NormalizePath(source);
+                if (!seen.Add(absoluteSource))
+                {
+                    continue;
+                }
+                bool protectedCanary = canaryDirectory != null &&
+                    string.Equals(absoluteSource, NormalizePath(canaryDirectory), StringComparison.OrdinalIgnoreCase);
+                sources.Add(new BackupSourceView(absoluteSource, protectedCanary));
+            }
+            if (sources.Count == 0)
+            {
+                throw new InvalidDataException("The backup configuration contains no source folders.");
+            }
+
+            return new SourceConfiguration
+            {
+                InstallRoot = installRoot,
+                ConfigurationPath = configurationPath,
+                ManagerPath = Path.Combine(installRoot, "Manage-Sources.ps1"),
+                Sources = sources
+            };
+        }
+
+        public bool ContainsUserSource(string sourcePath)
+        {
+            string normalized = NormalizePath(sourcePath);
+            foreach (BackupSourceView source in Sources)
+            {
+                if (!source.IsProtectedCanary &&
+                    string.Equals(source.SourcePath, normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static string ResolveProtectedInstallRoot()
+        {
+            string programFiles = Path.GetFullPath(
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+            string defaultRoot = Path.Combine(programFiles, "ResticBackuper");
+            string executableRoot = Path.GetFullPath(AppDomain.CurrentDomain.BaseDirectory)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+            if (IsWithin(executableRoot, programFiles) &&
+                File.Exists(Path.Combine(executableRoot, "backup-config.json")))
+            {
+                return executableRoot;
+            }
+            return defaultRoot;
+        }
+
+        private static bool IsWithin(string candidate, string parent)
+        {
+            string normalizedCandidate = Path.GetFullPath(candidate)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            string normalizedParent = Path.GetFullPath(parent)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return normalizedCandidate.StartsWith(normalizedParent, StringComparison.OrdinalIgnoreCase);
+        }
+
+        internal static string NormalizePath(string value)
+        {
+            string fullPath = Path.GetFullPath(value);
+            string root = Path.GetPathRoot(fullPath);
+            if (!string.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase))
+            {
+                fullPath = fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            }
+            return fullPath;
+        }
+    }
+
+    internal sealed class SourceManagerResult
+    {
+        public bool Succeeded { get; private set; }
+        public bool UserCancelled { get; private set; }
+        public int ExitCode { get; private set; }
+        public string ErrorMessage { get; private set; }
+
+        public static SourceManagerResult Success()
+        {
+            return new SourceManagerResult { Succeeded = true, ExitCode = 0 };
+        }
+
+        public static SourceManagerResult Cancelled()
+        {
+            return new SourceManagerResult { UserCancelled = true, ExitCode = 1223 };
+        }
+
+        public static SourceManagerResult Failure(string message, int exitCode)
+        {
+            return new SourceManagerResult { ErrorMessage = message, ExitCode = exitCode };
+        }
+    }
+
+    internal static class SourceManagerLauncher
+    {
+        public static SourceManagerResult Run(SourceConfiguration configuration, string action, string sourcePath)
+        {
+            if (configuration == null)
+            {
+                return SourceManagerResult.Failure("The protected configuration is unavailable.", -1);
+            }
+            if (!string.Equals(action, "Add", StringComparison.Ordinal) &&
+                !string.Equals(action, "Remove", StringComparison.Ordinal))
+            {
+                return SourceManagerResult.Failure("The requested source operation is invalid.", -1);
+            }
+            if (!Path.IsPathRooted(sourcePath))
+            {
+                return SourceManagerResult.Failure("The selected folder path is not absolute.", -1);
+            }
+            if (!File.Exists(configuration.ManagerPath))
+            {
+                return SourceManagerResult.Failure(
+                    "The protected source manager is missing from the installation.",
+                    -1);
+            }
+            FileAttributes managerAttributes = File.GetAttributes(configuration.ManagerPath);
+            if ((managerAttributes & FileAttributes.ReparsePoint) != 0)
+            {
+                return SourceManagerResult.Failure("The protected source manager is not a regular file.", -1);
+            }
+
+            string systemDirectory = Environment.GetFolderPath(Environment.SpecialFolder.System);
+            string powerShell = Path.Combine(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+            if (!File.Exists(powerShell))
+            {
+                return SourceManagerResult.Failure("Windows PowerShell is unavailable in System32.", -1);
+            }
+
+            WindowsIdentity identity = WindowsIdentity.GetCurrent();
+            string userSid = identity.User == null ? null : identity.User.Value;
+            if (string.IsNullOrEmpty(userSid))
+            {
+                return SourceManagerResult.Failure("The current Windows user SID could not be determined.", -1);
+            }
+
+            string[] arguments =
+            {
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                configuration.ManagerPath,
+                "-" + action,
+                SourceConfiguration.NormalizePath(sourcePath),
+                "-ExpectedUserSid",
+                userSid
+            };
+
+            ProcessStartInfo startInfo = new ProcessStartInfo();
+            startInfo.FileName = powerShell;
+            startInfo.Arguments = BuildArgumentString(arguments);
+            startInfo.WorkingDirectory = configuration.InstallRoot;
+            startInfo.UseShellExecute = true;
+            startInfo.Verb = "runas";
+            startInfo.WindowStyle = ProcessWindowStyle.Hidden;
+            startInfo.ErrorDialog = false;
+
+            try
+            {
+                using (Process process = Process.Start(startInfo))
+                {
+                    if (process == null)
+                    {
+                        return SourceManagerResult.Failure("Windows did not start the protected source manager.", -1);
+                    }
+                    process.WaitForExit();
+                    return process.ExitCode == 0
+                        ? SourceManagerResult.Success()
+                        : SourceManagerResult.Failure(
+                            "The protected source manager returned exit code " +
+                                process.ExitCode.ToString(CultureInfo.InvariantCulture) + ".",
+                            process.ExitCode);
+                }
+            }
+            catch (Win32Exception error)
+            {
+                if (error.NativeErrorCode == 1223)
+                {
+                    return SourceManagerResult.Cancelled();
+                }
+                return SourceManagerResult.Failure(error.Message, error.NativeErrorCode);
+            }
+            catch (Exception error)
+            {
+                return SourceManagerResult.Failure(error.Message, -1);
+            }
+        }
+
+        private static string BuildArgumentString(IEnumerable<string> arguments)
+        {
+            StringBuilder result = new StringBuilder();
+            foreach (string argument in arguments)
+            {
+                if (result.Length > 0)
+                {
+                    result.Append(' ');
+                }
+                result.Append(QuoteWindowsArgument(argument));
+            }
+            return result.ToString();
+        }
+
+        private static string QuoteWindowsArgument(string value)
+        {
+            if (value == null)
+            {
+                throw new ArgumentNullException("value");
+            }
+            if (value.Length > 0 && value.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) < 0)
+            {
+                return value;
+            }
+
+            StringBuilder result = new StringBuilder();
+            result.Append('"');
+            int backslashes = 0;
+            foreach (char character in value)
+            {
+                if (character == '\\')
+                {
+                    backslashes++;
+                    continue;
+                }
+                if (character == '"')
+                {
+                    result.Append('\\', backslashes * 2 + 1);
+                    result.Append('"');
+                    backslashes = 0;
+                    continue;
+                }
+                result.Append('\\', backslashes);
+                backslashes = 0;
+                result.Append(character);
+            }
+            result.Append('\\', backslashes * 2);
+            result.Append('"');
+            return result.ToString();
+        }
+    }
+}
