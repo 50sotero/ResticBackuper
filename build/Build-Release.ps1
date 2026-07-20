@@ -218,6 +218,12 @@ foreach ($name in @('Install.cmd', 'Install-ResticBackuper.ps1')) {
 foreach ($name in @('README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'dependencies.json', 'VERSION')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $bundleRoot $name) -Force
 }
+$bundleLicenses = Join-Path $bundleRoot 'licenses'
+New-Item -ItemType Directory -Path $bundleLicenses -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $projectRoot 'licenses\RESTIC.txt') `
+    -Destination (Join-Path $bundleLicenses 'RESTIC.txt') -Force
+Copy-Item -LiteralPath $pythonLicense `
+    -Destination (Join-Path $bundleLicenses 'PYTHON.txt') -Force
 $manifest = New-PayloadManifest
 
 $buildInfo = [ordered]@{

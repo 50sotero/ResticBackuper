@@ -19,10 +19,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from restic_common import (
     DEFAULT_CONFIG,
-    RunLock,
+    RunLockUnavailable,
+    SourceUpdateJournalPresent,
     atomic_write_json,
     ensure_free_space,
-    load_config,
+    load_config_under_lock,
     restic_base,
     run_capture,
     sanitized_command,
@@ -148,9 +149,7 @@ def verify_canary(
     return result
 
 
-def run(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    config = load_config(args.config, require_repository=True)
+def _run_locked(args: argparse.Namespace, config: dict[str, Any]) -> int:
     tag = args.tag or config["scheduled_tag"]
     state_directory = Path(config["state_directory"])
     logs_directory = state_directory / "logs"
@@ -187,13 +186,6 @@ def run(argv: list[str] | None = None) -> int:
         "errors": [],
         "verification": {},
     }
-    run_lock = RunLock(state_directory / "run.lock")
-    try:
-        run_lock.__enter__()
-    except RuntimeError as error:
-        print(f"BACKUP NOT STARTED: {error}", file=sys.stderr)
-        return 75
-
     try:
         atomic_write_json(status_path, status)
         with log_path.open(
@@ -453,6 +445,19 @@ def run(argv: list[str] | None = None) -> int:
         except (AttributeError, OSError):
             pass
         return int(status["exit_code"] or 1)
+
+
+def run(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        config, run_lock = load_config_under_lock(
+            args.config, require_repository=True
+        )
+    except (RunLockUnavailable, SourceUpdateJournalPresent) as error:
+        print(f"BACKUP NOT STARTED: {error}", file=sys.stderr)
+        return 75
+    try:
+        return _run_locked(args, config)
     finally:
         run_lock.__exit__(None, None, None)
 

@@ -22,6 +22,12 @@ from typing import Any, Callable
 
 PROJECT_DIRECTORY = Path(__file__).resolve().parent
 DEFAULT_CONFIG = PROJECT_DIRECTORY / "backup-config.json"
+PROTECTED_CONFIG = Path(r"C:\Program Files\ResticBackuper\backup-config.json")
+PROTECTED_STATE_DIRECTORY = Path(r"C:\ProgramData\ResticBackuper")
+SOURCE_UPDATE_JOURNAL_NAME = "source-update.journal.json"
+PROTECTED_SOURCE_UPDATE_JOURNAL = (
+    PROTECTED_STATE_DIRECTORY / SOURCE_UPDATE_JOURNAL_NAME
+)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 ATOMIC_WRITE_ATTEMPTS = 20
 ATOMIC_WRITE_MAX_DELAY_SECONDS = 0.5
@@ -497,6 +503,14 @@ def stream_command(
                     pass
 
 
+class RunLockUnavailable(RuntimeError):
+    """Raised when another protected operation owns byte zero of run.lock."""
+
+
+class SourceUpdateJournalPresent(RuntimeError):
+    """Raised when source-manager crash recovery must finish before a run."""
+
+
 class RunLock(AbstractContextManager["RunLock"]):
     def __init__(self, path: Path):
         self.path = path
@@ -514,17 +528,87 @@ class RunLock(AbstractContextManager["RunLock"]):
         except OSError as error:
             self.handle.close()
             self.handle = None
-            raise RuntimeError("another backup process already holds the run lock") from error
+            raise RunLockUnavailable(
+                "another backup process already holds the run lock"
+            ) from error
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         if self.handle is not None:
-            self.handle.seek(0)
+            handle = self.handle
+            self.handle = None
             try:
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             finally:
-                self.handle.close()
-                self.handle = None
+                # Closing a Windows file handle releases its byte locks even
+                # if seeking or the explicit unlock operation itself fails.
+                handle.close()
+
+
+def _same_windows_path(left: Path, right: Path) -> bool:
+    return ntpath.normcase(ntpath.abspath(str(left))) == ntpath.normcase(
+        ntpath.abspath(str(right))
+    )
+
+
+def _preliminary_state_directory(config_path: Path) -> Path:
+    """Choose only the lock location; authoritative config is loaded later."""
+    if _same_windows_path(config_path, PROTECTED_CONFIG):
+        return PROTECTED_STATE_DIRECTORY
+    preliminary = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(preliminary, dict):
+        raise ValueError("backup configuration must be one JSON object")
+    state_value = preliminary.get("state_directory")
+    if not isinstance(state_value, str) or not state_value:
+        raise ValueError("configuration has no valid state_directory for its run lock")
+    return Path(state_value).resolve(strict=False)
+
+
+def source_update_journal_path(state_directory: Path) -> Path:
+    """Return the fixed journal name below the already selected lock state."""
+    if _same_windows_path(state_directory, PROTECTED_STATE_DIRECTORY):
+        return PROTECTED_SOURCE_UPDATE_JOURNAL
+    return state_directory / SOURCE_UPDATE_JOURNAL_NAME
+
+
+def load_config_under_lock(
+    path: Path = DEFAULT_CONFIG,
+    *,
+    require_repository: bool = True,
+    before_lock: Callable[[], None] | None = None,
+) -> tuple[dict[str, Any], RunLock]:
+    """Acquire the shared byte lock, then load and validate current config.
+
+    Protected scheduled runs choose the fixed ProgramData lock without reading
+    configuration first. Disposable/manual configurations read only their lock
+    directory before locking, then reload the full configuration and reject a
+    state-directory change. Thus a process paused before locking cannot later
+    run source paths that a completed source-manager transaction replaced.
+    """
+    config_path = path.resolve(strict=True)
+    lock_state = _preliminary_state_directory(config_path)
+    if before_lock is not None:
+        before_lock()
+    run_lock = RunLock(lock_state / "run.lock")
+    run_lock.__enter__()
+    try:
+        journal_path = source_update_journal_path(lock_state)
+        if os.path.lexists(journal_path):
+            raise SourceUpdateJournalPresent(
+                "source-update recovery is pending; run the protected source "
+                "manager to reconcile its journal before backup"
+            )
+        config = load_config(config_path, require_repository=require_repository)
+        authoritative_state = Path(config["state_directory"]).resolve(strict=False)
+        if not _same_windows_path(authoritative_state, lock_state):
+            raise RuntimeError(
+                "configuration state_directory changed while waiting for the run lock"
+            )
+        return config, run_lock
+    except BaseException:
+        run_lock.__exit__(None, None, None)
+        raise
 
 
 def windows_snapshot_path(path: Path) -> str:

@@ -351,6 +351,27 @@ function Get-DefaultSources {
     )
 }
 
+function Assert-SourceDrive {
+    param(
+        [string]$Directory,
+        [bool]$UseVss
+    )
+    $root = [IO.Path]::GetPathRoot($Directory)
+    if ([string]::IsNullOrWhiteSpace($root) -or $root -notmatch '^[A-Za-z]:\\$') {
+        throw "Backup sources must use a local drive-letter path; UNC and network sources are not supported: $Directory"
+    }
+    $drive = [IO.DriveInfo]::new($root)
+    if (-not $drive.IsReady -or
+        $drive.DriveType -notin @([IO.DriveType]::Fixed, [IO.DriveType]::Removable)) {
+        throw "A backup source must be on a ready local fixed or removable drive: $Directory"
+    }
+    if ($UseVss -and
+        ($drive.DriveType -ne [IO.DriveType]::Fixed -or
+         -not [string]::Equals([string]$drive.DriveFormat, 'NTFS', [StringComparison]::OrdinalIgnoreCase))) {
+        throw "VSS is enabled, so every source must be on a ready local fixed NTFS volume; use -DisableVss only for supported local removable or non-NTFS sources: $Directory"
+    }
+}
+
 function Get-RepositoryVolume {
     param([string]$Path)
     $root = [IO.Path]::GetPathRoot($Path)
@@ -504,6 +525,7 @@ if (-not $SourceList) {
     $answer = Read-Host "Source folders, separated by semicolons [$shown]"
     $SourceList = if ([string]::IsNullOrWhiteSpace($answer)) { $shown } else { $answer.Trim() }
 }
+$useVss = -not $DisableVss
 $sourceCandidates = @($SourceList.Split(';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if ($sourceCandidates.Count -eq 0) {
     throw 'At least one source directory is required.'
@@ -512,6 +534,9 @@ $sourceSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordina
 $sources = @()
 foreach ($candidate in $sourceCandidates) {
     $source = Get-NormalizedPath $candidate
+    # Reject UNC/network and unsupported drive classes before any filesystem
+    # probe can contact a remote path or accept a source the manager cannot edit.
+    Assert-SourceDrive -Directory $source -UseVss $useVss
     if (-not (Test-Path -LiteralPath $source -PathType Container)) {
         throw "Source directory does not exist: $source"
     }
@@ -551,6 +576,9 @@ foreach ($source in $sources) {
 if (-not $canaryAlreadyCovered) {
     $configuredSources += $canarySource
 }
+foreach ($source in $configuredSources) {
+    Assert-SourceDrive -Directory $source -UseVss $useVss
+}
 $recoveryKey = Join-Path $userProfileRoot 'ResticBackuper-RecoveryKey.txt'
 $secretFile = Join-Path $stateRoot 'repository-password.dpapi.json'
 Assert-NoReparsePath -Path $recoveryKey
@@ -571,23 +599,6 @@ if ($volume.filesystem -ne 'NTFS') {
 $minimumBytes = [long]$MinimumFreeGiB * 1GB
 if ($volume.free_bytes -lt $minimumBytes) {
     throw "Repository volume has less than $MinimumFreeGiB GiB free."
-}
-
-$useVss = -not $DisableVss
-if ($useVss) {
-    foreach ($source in $configuredSources) {
-        $root = [IO.Path]::GetPathRoot($source)
-        if (-not $root -or $root.StartsWith('\\')) {
-            throw "VSS requires local drive-letter sources; use -DisableVss for: $source"
-        }
-        $sourceDrive = [IO.DriveInfo]::new($root)
-        if (-not $sourceDrive.IsReady -or $sourceDrive.DriveType -notin @([IO.DriveType]::Removable, [IO.DriveType]::Fixed)) {
-            throw "VSS requires a ready local fixed or removable source: $source"
-        }
-        if ([string]$sourceDrive.DriveFormat -ne 'NTFS') {
-            throw "VSS requires NTFS in this alpha; use -DisableVss for: $source"
-        }
-    }
 }
 
 if (Test-Path -LiteralPath $installRoot) {

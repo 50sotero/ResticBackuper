@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes ResticBackuper v0.1.0-alpha.1 for Windows x64. The
+This document describes ResticBackuper v0.1.0-alpha.2 for Windows x64. The
 design wraps Restic with conservative validation, Windows scheduling and VSS,
 local telemetry, and a recovery workflow. Restic remains the component that
 creates, encrypts, deduplicates, and restores repository snapshots.
@@ -35,8 +35,8 @@ process continues writing to the repository.
 `backup.py` obtains a single-run lock, validates the configured repository
 volume and available space, and invokes Restic with the exact source and
 exclusion set. When configured, Restic asks Windows VSS for filesystem
-snapshots of the local NTFS sources so open files can be read from a consistent
-view.
+snapshots of local fixed NTFS sources so open files can be read from a
+consistent view.
 
 ## Successful-run criteria
 
@@ -66,7 +66,7 @@ restores of representative user data remain essential.
 | Embedded Python and `backup.py` | Validates configuration, drives Restic, verifies results, records status | Repository through Restic; protected state |
 | `restic.exe` | Creates encrypted snapshots, checks the repository, and restores data | Repository and explicit restore target |
 | `ResticBackuperDashboard.exe` | Reads status, logs, history, and configured sources; launches explicit UAC folder changes | No direct configuration or repository writes |
-| `Manage-Sources.ps1` | Validates and atomically adds/removes future backup sources while holding the run lock | Protected configuration and recovery-tools metadata |
+| `Manage-Sources.ps1` | Validates and transactionally adds/removes future backup sources while holding the run lock; a durable undo journal coordinates atomic per-file replacements | Protected configuration, protected journal, and recovery-tools metadata |
 | `restore.py` | Guards snapshot listing and restores to a non-overlapping new or empty target | Explicit restore target only |
 | Installer/uninstaller | Installs protected runtime, creates tasks and shortcuts, manages application binaries | Program Files, ProgramData, Task Scheduler, registry, chosen repository during initialization |
 
@@ -83,8 +83,9 @@ ordinary users must not be able to replace files in this tree.
 
 Contains the CurrentUser DPAPI password envelope, protected restore canary, run
 lock, status records, JSONL logs, last-successful record, and local metrics
-history. Writers run from the protected scheduled task; the dashboard receives
-read access.
+history. During a folder-list change it may also contain the protected
+source-update undo journal. Writers run from the protected scheduled task or
+elevated source manager; the dashboard receives read access.
 
 ### User-selected repository
 
@@ -120,7 +121,13 @@ a checksum for the final ZIP. The installer validates every staged payload
 file against its own path, size, and SHA-256 manifest before copying it into
 the protected runtime.
 
-This is integrity checking, not publisher authentication. v0.1.0-alpha.1 has
+ZIP entry metadata is normalized, but the legacy .NET Framework C# compiler can
+emit nondeterministic executable bytes. Rebuilding the same source is therefore
+not guaranteed to reproduce the release ZIP byte for byte. The published
+SHA-256 identifies the exact frozen release artifact; it is an integrity value,
+not a reproducible-build claim.
+
+This is integrity checking, not publisher authentication. v0.1.0-alpha.2 has
 no Authenticode code signature, so users must obtain the checksum from the
 project's GitHub release, compare it locally, and decide whether they trust the
 project. A signed graphical installer is a future distribution goal, not a
@@ -156,13 +163,27 @@ The limited dashboard cannot write Program Files. Add/remove actions start the
 protected source manager through UAC with the requesting user's SID. The
 manager takes the same byte-range lock used by the backup wrapper, rejects
 repository/runtime/state overlap and nested sources, protects the canary and
-last user source, then updates both the live configuration and RecoveryTools
-copy. Removing a source changes future snapshots only; it never forgets or
+last user source, and enforces the same drive policy as installation: every
+source must be on a ready local fixed or removable drive-letter volume; VSS
+tightens that policy to fixed NTFS volumes. UNC and network sources are never
+accepted. Removing a source changes future snapshots only; it never forgets or
 prunes existing snapshots.
+
+Before replacing any of the four coupled source-metadata files, the manager
+writes and flushes a protected undo journal containing the verified previous
+and proposed bytes for fixed target identities. Each file is then replaced
+atomically and the new set is fully revalidated. Deleting the journal is the
+commit point. A backup refuses to start while a journal is pending; after a
+process termination or restart, the next manager invocation restores and
+verifies the complete previous set before deleting the journal. This avoids
+consuming a mixed live/recovery manifest set after an interrupted change.
 
 ## Failure behavior
 
 - A process-level run lock prevents concurrent wrapper runs.
+- A pending protected source-update journal makes backup runs fail closed. The
+  next elevated source-manager invocation uses its undo records to restore and
+  verify the complete pre-change metadata set before normal work continues.
 - Restic retries repository locks for a bounded period.
 - State JSON is replaced atomically so the dashboard does not consume a
   partially written file.
@@ -176,7 +197,11 @@ prunes existing snapshots.
 ## Boundaries and non-goals for the alpha
 
 - Only Windows x64 and local fixed/removable NTFS repositories are supported.
-- VSS support is limited to local NTFS sources.
+- Sources must be existing folders on ready local fixed or removable
+  drive-letter volumes; UNC and network sources are unsupported even when VSS
+  is disabled.
+- VSS support is limited to local fixed NTFS source volumes. Disabling VSS can
+  admit supported local removable or non-NTFS source volumes.
 - There is no code signature, automatic updater, or in-place upgrade.
 - There is no built-in cloud upload, off-site replication, retention, pruning,
   or repository deletion workflow.

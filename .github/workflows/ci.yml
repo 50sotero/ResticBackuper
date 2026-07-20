@@ -50,6 +50,10 @@ jobs:
         shell: pwsh
         run: python -m unittest discover -s tests -v
 
+      - name: Exercise protected source-management transactions
+        shell: powershell
+        run: .\tests\Test-ManageSources.ps1
+
       - name: Build checksum-pinned Windows release
         shell: pwsh
         run: .\build\Build-Release.ps1

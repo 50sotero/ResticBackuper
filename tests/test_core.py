@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -15,6 +16,7 @@ SOURCE = PROJECT / "src"
 sys.path.insert(0, str(SOURCE))
 
 import backup
+import dry_run
 import restic_common
 import restore
 import secret_store
@@ -129,6 +131,161 @@ class CoreSafetyTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "protected repository state"):
                 restic_common.load_config(config_path, require_repository=False)
+
+    def test_protected_lock_paths_are_fixed_public_locations(self) -> None:
+        self.assertEqual(
+            Path(r"C:\Program Files\ResticBackuper\backup-config.json"),
+            restic_common.PROTECTED_CONFIG,
+        )
+        self.assertEqual(
+            Path(r"C:\ProgramData\ResticBackuper"),
+            restic_common.PROTECTED_STATE_DIRECTORY,
+        )
+
+    def test_wrappers_release_lock_when_locked_body_raises(self) -> None:
+        class FakeLock:
+            def __init__(self) -> None:
+                self.released = False
+
+            def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+                self.released = True
+
+        for module, entrypoint, locked_name in (
+            (backup, backup.run, "_run_locked"),
+            (dry_run, dry_run.main, "_run_locked"),
+        ):
+            with self.subTest(module=module.__name__):
+                held = FakeLock()
+                with (
+                    mock.patch.object(
+                        module, "load_config_under_lock", return_value=({}, held)
+                    ),
+                    mock.patch.object(
+                        module,
+                        locked_name,
+                        side_effect=PermissionError("pre-status fixture failure"),
+                    ),
+                ):
+                    with self.assertRaisesRegex(PermissionError, "pre-status"):
+                        entrypoint([])
+                self.assertTrue(held.released)
+
+    def test_paused_prelock_process_reloads_sources_after_locked_update(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="resticbackuper-lock-race-") as root_text:
+            root = Path(root_text)
+            old_source = root / "old-source"
+            new_source = root / "new-source"
+            old_source.mkdir()
+            new_source.mkdir()
+            config_path = self._write_config(root, sources=[old_source])
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            state = Path(config["state_directory"])
+            paused = threading.Event()
+            continue_to_lock = threading.Event()
+            outcome: dict[str, object] = {}
+
+            def before_lock() -> None:
+                paused.set()
+                if not continue_to_lock.wait(timeout=10):
+                    raise TimeoutError("test did not release paused pre-lock process")
+
+            def worker() -> None:
+                try:
+                    loaded, held = restic_common.load_config_under_lock(
+                        config_path,
+                        require_repository=False,
+                        before_lock=before_lock,
+                    )
+                    try:
+                        outcome["sources"] = loaded["sources"]
+                    finally:
+                        held.__exit__(None, None, None)
+                except BaseException as error:
+                    outcome["error"] = error
+
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            self.assertTrue(paused.wait(timeout=10), "worker did not reach pre-lock pause")
+            with restic_common.RunLock(state / "run.lock"):
+                config["sources"] = [str(old_source), str(new_source)]
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+            continue_to_lock.set()
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive(), "worker did not finish")
+            self.assertNotIn("error", outcome)
+            self.assertEqual(
+                [str(old_source.resolve()), str(new_source.resolve())],
+                outcome["sources"],
+            )
+
+    def test_state_directory_change_is_rejected_and_lock_released(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="resticbackuper-state-race-") as root_text:
+            root = Path(root_text)
+            config_path = self._write_config(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            original_state = Path(config["state_directory"])
+            changed_state = root / "changed-state"
+
+            def change_state_before_lock() -> None:
+                config["state_directory"] = str(changed_state)
+                config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                RuntimeError, "state_directory changed while waiting"
+            ):
+                restic_common.load_config_under_lock(
+                    config_path,
+                    require_repository=False,
+                    before_lock=change_state_before_lock,
+                )
+
+            # The post-acquire validation exception must synchronously release
+            # byte zero so another protected operation can proceed immediately.
+            with restic_common.RunLock(original_state / "run.lock"):
+                pass
+
+    def test_pending_source_update_journal_fails_closed_and_releases_lock(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="resticbackuper-journal-") as root_text:
+            root = Path(root_text)
+            config_path = self._write_config(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            state = Path(config["state_directory"])
+            state.mkdir(parents=True)
+            journal = state / restic_common.SOURCE_UPDATE_JOURNAL_NAME
+            journal.write_text("pending disposable transaction\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                restic_common.SourceUpdateJournalPresent,
+                "source-update recovery is pending",
+            ):
+                restic_common.load_config_under_lock(
+                    config_path,
+                    require_repository=False,
+                )
+
+            # Detection happens after acquiring byte zero. The exceptional path
+            # must release it synchronously so the protected manager can recover.
+            with restic_common.RunLock(state / "run.lock"):
+                pass
+
+    def test_run_lock_closes_handle_even_if_explicit_unlock_setup_fails(self) -> None:
+        class FailingHandle:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def seek(self, _position: int) -> None:
+                raise OSError("simulated seek failure")
+
+            def close(self) -> None:
+                self.closed = True
+
+        run_lock = restic_common.RunLock(Path("unused"))
+        handle = FailingHandle()
+        run_lock.handle = handle
+        with self.assertRaisesRegex(OSError, "seek failure"):
+            run_lock.__exit__(None, None, None)
+        self.assertTrue(handle.closed)
+        self.assertIsNone(run_lock.handle)
 
     def test_atomic_json_write_retries_transient_replace_failure(self) -> None:
         with tempfile.TemporaryDirectory(prefix="resticbackuper-atomic-") as root_text:

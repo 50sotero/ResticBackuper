@@ -15,16 +15,108 @@ namespace ResticBackuper.Dashboard
     {
         public string SourcePath { get; private set; }
         public bool IsProtectedCanary { get; private set; }
+        public string DisplayName { get; private set; }
+        public string ShortPath { get; private set; }
 
         public string RoleLabel
         {
-            get { return IsProtectedCanary ? "Protected canary" : "Backed-up folder"; }
+            get { return IsProtectedCanary ? "Required" : "Protected"; }
         }
 
         public BackupSourceView(string sourcePath, bool isProtectedCanary)
         {
             SourcePath = sourcePath;
             IsProtectedCanary = isProtectedCanary;
+            DisplayName = BuildDisplayName(sourcePath, isProtectedCanary);
+            ShortPath = BuildShortPath(sourcePath);
+        }
+
+        private static string BuildDisplayName(string sourcePath, bool isProtectedCanary)
+        {
+            if (isProtectedCanary)
+            {
+                return "Restore verification canary";
+            }
+
+            string[,] knownFolders =
+            {
+                { Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Desktop" },
+                { Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "Documents" },
+                { Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "Pictures" },
+                { Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "Music" },
+                { Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "Videos" },
+                { Environment.GetFolderPath(Environment.SpecialFolder.Favorites), "Favorites" }
+            };
+            for (int index = 0; index < knownFolders.GetLength(0); index++)
+            {
+                string knownPath = knownFolders[index, 0];
+                if (!string.IsNullOrWhiteSpace(knownPath) &&
+                    string.Equals(sourcePath, knownPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return knownFolders[index, 1];
+                }
+            }
+
+            string root = Path.GetPathRoot(sourcePath);
+            if (string.Equals(sourcePath, root, StringComparison.OrdinalIgnoreCase))
+            {
+                return root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + " drive";
+            }
+
+            string folderName = new DirectoryInfo(sourcePath).Name;
+            if (string.Equals(folderName, ".codex", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Codex configuration";
+            }
+            if (string.Equals(folderName, "My Drive", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Google Drive - My Drive";
+            }
+            if (string.Equals(folderName, "code", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Software projects";
+            }
+            return string.IsNullOrWhiteSpace(folderName) ? sourcePath : folderName;
+        }
+
+        private static string BuildShortPath(string sourcePath)
+        {
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            string programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+            string shortened = ReplacePathRoot(sourcePath, userProfile, "~");
+            shortened = ReplacePathRoot(shortened, programData, "%PROGRAMDATA%");
+            if (shortened.Length <= 58)
+            {
+                return shortened;
+            }
+
+            string root = Path.GetPathRoot(sourcePath) ?? string.Empty;
+            DirectoryInfo directory = new DirectoryInfo(sourcePath);
+            string leaf = directory.Name;
+            string parent = directory.Parent == null ? string.Empty : directory.Parent.Name;
+            string tail = string.IsNullOrWhiteSpace(parent)
+                ? leaf
+                : parent + Path.DirectorySeparatorChar + leaf;
+            return root + "..." + Path.DirectorySeparatorChar + tail;
+        }
+
+        private static string ReplacePathRoot(string sourcePath, string rootPath, string replacement)
+        {
+            if (string.IsNullOrWhiteSpace(rootPath))
+            {
+                return sourcePath;
+            }
+            string normalizedRoot = rootPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (string.Equals(sourcePath, normalizedRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                return replacement;
+            }
+            string prefix = normalizedRoot + Path.DirectorySeparatorChar;
+            if (sourcePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return replacement + Path.DirectorySeparatorChar + sourcePath.Substring(prefix.Length);
+            }
+            return sourcePath;
         }
     }
 

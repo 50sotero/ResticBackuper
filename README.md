@@ -8,25 +8,49 @@ telemetry dashboard, UAC-protected source-folder management, protected local
 credentials, and verification that includes a real canary restore.
 
 > [!WARNING]
-> **v0.1.0-alpha.1 is an early public test release.** Its installer and
+> **v0.1.0-alpha.2 is an early public test release.** Its installer and
 > executables are not code-signed, and the project has not yet been validated
 > across a broad range of Windows machines. Test it with non-critical data and
 > an independent restore target before relying on it. Keep another backup while
 > you evaluate it.
+
+## How the creator uses it
+
+ResticBackuper grew out of a real nightly Windows backup routine. The protected
+set includes software projects, a local Google Drive mirror, Codex configuration
+and home data, and ordinary personal folders. Dependency trees, caches, and
+build outputs that can be reproduced from source and lockfiles are excluded, so
+the backup concentrates on original work and irreplaceable data.
+
+Each run writes an encrypted, incremental snapshot to a local Restic repository
+for fast recovery. A successful status also requires repository checks and a
+real canary-file restore whose content is verified. In the creator's setup, a
+separate scheduled sync copies the encrypted repository to Google Drive for an
+off-site copy, while recovery material is kept separately.
+
+That Google Drive sync is an additional layer in this particular deployment;
+the current ResticBackuper alpha does not install or configure cloud storage.
+This example is not a substitute for choosing sources, exclusions, retention,
+and restore tests appropriate to your own threat model.
 
 ## What it does
 
 - Creates encrypted, deduplicated, incremental snapshots with
   [Restic](https://restic.net/).
 - Optionally uses Windows Volume Shadow Copy Service (VSS) to capture a
-  consistent view of open files on local NTFS volumes.
+  consistent view of open files on local fixed NTFS volumes.
 - Runs every day through Task Scheduler at the time you choose while the
   installing Windows user is signed in.
 - Shows live progress, throughput, elapsed time, ETA, errors, and local run
   history in a tray-friendly dashboard.
-- Displays every backed-up folder and lets the user add or remove folders
-  through a separate elevated manager. Removing a folder never deletes old
-  snapshots.
+- Keeps the **Protected folders** inventory and a persistent **Add folder**
+  action above the detailed telemetry, with an explicit removal action on each
+  removable folder.
+- Applies folder changes through a separate elevated manager. Removing a folder
+  stops future backups of that source but never deletes old snapshots, and the
+  required canary source cannot be removed.
+- Supports keyboard navigation, visible focus states, accessible control names,
+  readable action targets, and status cues that do not rely on color alone.
 - Rejects a run as unsuccessful unless the resulting snapshot exactly matches
   the configured source set.
 - Runs a Restic repository structure check and restores a small canary file,
@@ -49,8 +73,10 @@ test a retention policy.
   starts the installer
 - A local fixed or removable NTFS drive-letter path for the Restic repository;
   a separate physical drive is strongly recommended
-- Local NTFS source volumes when VSS is enabled; other sources require the
-  `-DisableVss` installer option
+- Source folders on ready local fixed or removable drive-letter volumes. UNC
+  and network sources are not supported, including with `-DisableVss`.
+- With VSS enabled (the default), every source volume must be fixed and NTFS.
+  `-DisableVss` permits supported local removable or non-NTFS source volumes.
 - Enough free space for the first full snapshot (the installer requires at
   least 10 GiB by default)
 
@@ -65,8 +91,8 @@ required.
 2. Verify the download before extracting it:
 
    ```powershell
-   Get-FileHash .\ResticBackuper-v0.1.0-alpha.1-windows-x64.zip -Algorithm SHA256
-   Get-Content .\ResticBackuper-v0.1.0-alpha.1-windows-x64.zip.sha256
+   Get-FileHash .\ResticBackuper-v0.1.0-alpha.2-windows-x64.zip -Algorithm SHA256
+   Get-Content .\ResticBackuper-v0.1.0-alpha.2-windows-x64.zip.sha256
    ```
 
    The two SHA-256 values must match exactly.
@@ -96,7 +122,7 @@ paths are separated by semicolons:
 
 ```powershell
 .\Install-ResticBackuper.ps1 `
-  -Repository 'D:\ResticBackups\Personal' `
+  -Repository 'D:\Backups\ResticRepository' `
   -SourceList 'C:\Users\you\Documents;C:\Users\you\Pictures' `
   -Schedule '02:00' `
   -Unattended `
@@ -105,7 +131,8 @@ paths are separated by semicolons:
 
 Omit `-StartBackup` to install and schedule the job without immediately
 starting the first backup. Use `-DisableVss` only when you accept losing VSS
-capture, or `-SkipDashboard` for a headless installation.
+capture and need a supported local removable or non-NTFS source; it does not
+enable UNC or network sources. Use `-SkipDashboard` for a headless installation.
 
 ## Verify that recovery works
 
@@ -166,6 +193,11 @@ release.
 - Dashboard telemetry remains read-only. Folder-list changes are performed by
   a separate UAC-elevated manager in the protected runtime, never by the
   limited dashboard process.
+- Source-list changes use a flushed protected undo journal plus atomic
+  per-file replacements for the live configuration and both runtime/recovery
+  manifests. Until journal deletion commits a fully verified change, backup
+  runs fail closed; a later manager invocation restores the complete previous
+  file set after an interrupted update.
 - Restore targets must be new or empty and cannot overlap a configured source
   or the repository.
 
@@ -184,6 +216,12 @@ Release builds are produced on 64-bit Windows. The build verifies and stages
 the pinned Python and Restic dependencies, compiles the native Windows
 launcher and WPF dashboard with .NET Framework 4.8 tooling, generates a
 payload manifest, and creates the distributable ZIP plus checksum.
+
+The ZIP writer normalizes package entry metadata, but the legacy .NET Framework
+C# compiler can emit nondeterministic executable bytes. Builds from the same
+source are therefore not guaranteed to reproduce the published ZIP byte for
+byte. A release SHA-256 identifies and verifies that exact frozen artifact; it
+is not a reproducible-build claim.
 
 ```powershell
 .\build\Build-Release.ps1

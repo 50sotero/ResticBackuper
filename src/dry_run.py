@@ -18,10 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from restic_common import (
     DEFAULT_CONFIG,
-    RunLock,
+    RunLockUnavailable,
+    SourceUpdateJournalPresent,
     atomic_write_json,
     ensure_free_space,
-    load_config,
+    load_config_under_lock,
     restic_base,
     sanitized_command,
     sha256_file,
@@ -37,9 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
-    config = load_config(args.config, require_repository=True)
+def _run_locked(config: dict[str, Any]) -> int:
     state_directory = Path(config["state_directory"])
     logs_directory = state_directory / "logs"
     logs_directory.mkdir(parents=True, exist_ok=True)
@@ -72,13 +71,6 @@ def main(argv: list[str] | None = None) -> int:
         "summary": None,
         "restic_exit_code": None,
     }
-    run_lock = RunLock(state_directory / "run.lock")
-    try:
-        run_lock.__enter__()
-    except RuntimeError as error:
-        print(f"DRY RUN NOT STARTED: {error}", file=sys.stderr)
-        return 75
-
     try:
         validate_repository_volume(config)
         report["free_bytes_before"] = ensure_free_space(config)
@@ -186,6 +178,19 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json(report_path, report)
         print(f"DRY RUN FAILED: {error}", file=sys.stderr)
         return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        config, run_lock = load_config_under_lock(
+            args.config, require_repository=True
+        )
+    except (RunLockUnavailable, SourceUpdateJournalPresent) as error:
+        print(f"DRY RUN NOT STARTED: {error}", file=sys.stderr)
+        return 75
+    try:
+        return _run_locked(config)
     finally:
         run_lock.__exit__(None, None, None)
 

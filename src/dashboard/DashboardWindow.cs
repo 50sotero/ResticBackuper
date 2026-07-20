@@ -8,6 +8,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Data;
@@ -68,11 +69,11 @@ namespace ResticBackuper.Dashboard
         private TextBlock lastUpdated;
         private TextBlock runCount;
         private DataGrid historyGrid;
-        private DataGrid sourceGrid;
+        private StackPanel sourceList;
         private RunChart runChart;
         private Button previewButton;
         private Button addSourceButton;
-        private Button removeSourceButton;
+        private readonly List<Button> removeSourceButtons = new List<Button>();
         private TextBlock sourceSummary;
         private TextBlock sourceStatus;
 
@@ -98,10 +99,10 @@ namespace ResticBackuper.Dashboard
             this.reader = new TelemetryReader(options.StateDirectory, true);
 
             Title = "ResticBackuper Dashboard";
-            Width = 1280;
-            Height = 950;
-            MinWidth = 1040;
-            MinHeight = 820;
+            Width = 1360;
+            Height = 880;
+            MinWidth = 900;
+            MinHeight = 640;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             Background = new LinearGradientBrush(
                 ((SolidColorBrush)BackgroundTop).Color,
@@ -128,57 +129,71 @@ namespace ResticBackuper.Dashboard
         private UIElement BuildInterface()
         {
             Grid root = new Grid();
-            root.Margin = new Thickness(28, 22, 28, 18);
+            root.Margin = new Thickness(32, 24, 32, 22);
+            root.HorizontalAlignment = HorizontalAlignment.Stretch;
             root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(18) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(220) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(16) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(112) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(16) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(170) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(16) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(28) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto, MinHeight = 300 });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(18) });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(30) });
 
             UIElement header = BuildHeader();
             Grid.SetRow(header, 0);
             root.Children.Add(header);
 
+            Grid protectionOverview = new Grid();
+            protectionOverview.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.18, GridUnitType.Star) });
+            protectionOverview.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(16) });
+            protectionOverview.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.92, GridUnitType.Star) });
+
             UIElement hero = BuildHero();
-            Grid.SetRow(hero, 2);
-            root.Children.Add(hero);
+            protectionOverview.Children.Add(hero);
+
+            UIElement sources = BuildSources();
+            Grid.SetColumn(sources, 2);
+            protectionOverview.Children.Add(sources);
+            Grid.SetRow(protectionOverview, 2);
+            root.Children.Add(protectionOverview);
 
             UIElement metrics = BuildMetrics();
             Grid.SetRow(metrics, 4);
             root.Children.Add(metrics);
 
-            UIElement sources = BuildSources();
-            Grid.SetRow(sources, 6);
-            root.Children.Add(sources);
-
             UIElement history = BuildHistory();
-            Grid.SetRow(history, 8);
+            Grid.SetRow(history, 6);
             root.Children.Add(history);
 
             TextBlock footer = new TextBlock();
             footer.Text = "READ-ONLY TELEMETRY  •  UAC-PROTECTED FOLDER CHANGES  •  LOCAL METRICS  •  REFRESHES EVERY SECOND";
             footer.Foreground = BrushFrom("#617089");
-            footer.FontSize = 10;
+            footer.FontSize = 12;
             footer.FontWeight = FontWeights.SemiBold;
             footer.VerticalAlignment = VerticalAlignment.Bottom;
             footer.HorizontalAlignment = HorizontalAlignment.Left;
             lastUpdated = new TextBlock();
             lastUpdated.Foreground = BrushFrom("#617089");
-            lastUpdated.FontSize = 10;
+            lastUpdated.FontSize = 12;
             lastUpdated.HorizontalAlignment = HorizontalAlignment.Right;
             lastUpdated.VerticalAlignment = VerticalAlignment.Bottom;
 
             Grid footerGrid = new Grid();
             footerGrid.Children.Add(footer);
             footerGrid.Children.Add(lastUpdated);
-            Grid.SetRow(footerGrid, 9);
+            Grid.SetRow(footerGrid, 8);
             root.Children.Add(footerGrid);
-            return root;
+
+            ScrollViewer page = new ScrollViewer();
+            page.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+            page.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+            page.HorizontalContentAlignment = HorizontalAlignment.Stretch;
+            page.CanContentScroll = false;
+            page.Content = root;
+            AutomationProperties.SetName(page, "ResticBackuper dashboard");
+            return page;
         }
 
         private UIElement BuildHeader()
@@ -205,17 +220,24 @@ namespace ResticBackuper.Dashboard
             StackPanel actions = new StackPanel();
             actions.Orientation = Orientation.Horizontal;
             actions.VerticalAlignment = VerticalAlignment.Center;
-            previewButton = CreateButton(previewEnabled ? "Stop preview" : "Preview animation");
+            previewButton = CreateButton(previewEnabled ? "Stop preview" : "Preview backup flow");
+            AutomationProperties.SetHelpText(
+                previewButton,
+                "Shows an animated example without starting a backup.");
             previewButton.Click += delegate
             {
                 previewEnabled = !previewEnabled;
                 previewStarted = DateTime.Now;
-                previewButton.Content = previewEnabled ? "Stop preview" : "Preview animation";
+                previewButton.Content = previewEnabled ? "Stop preview" : "Preview backup flow";
+                AutomationProperties.SetName(
+                    previewButton,
+                    previewEnabled ? "Stop backup flow preview" : "Preview backup flow");
                 RefreshDashboard();
             };
             actions.Children.Add(previewButton);
 
             Button refresh = CreateButton("Refresh");
+            AutomationProperties.SetHelpText(refresh, "Refresh backup status, folder protection, and run history.");
             refresh.Margin = new Thickness(10, 0, 14, 0);
             refresh.Click += delegate { RefreshDashboard(); };
             actions.Children.Add(refresh);
@@ -227,7 +249,7 @@ namespace ResticBackuper.Dashboard
             statusDot.Margin = new Thickness(0, 0, 8, 0);
             statusBadgeText = new TextBlock();
             statusBadgeText.Text = "LOADING";
-            statusBadgeText.FontSize = 11;
+            statusBadgeText.FontSize = 12;
             statusBadgeText.FontWeight = FontWeights.Bold;
             statusBadgeText.Foreground = PrimaryText;
             StackPanel badgeContent = new StackPanel();
@@ -241,6 +263,7 @@ namespace ResticBackuper.Dashboard
             statusBadge.CornerRadius = new CornerRadius(16);
             statusBadge.Padding = new Thickness(13, 8, 13, 8);
             statusBadge.Child = badgeContent;
+            AutomationProperties.SetName(statusBadge, "Backup status");
             actions.Children.Add(statusBadge);
 
             Grid.SetColumn(actions, 1);
@@ -252,7 +275,7 @@ namespace ResticBackuper.Dashboard
         {
             Border card = CreateCard();
             Grid grid = new Grid();
-            grid.Margin = new Thickness(25, 21, 22, 20);
+            grid.Margin = new Thickness(23, 18, 20, 18);
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(2.2, GridUnitType.Star) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(24) });
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -319,7 +342,7 @@ namespace ResticBackuper.Dashboard
             progressMeta.Children.Add(progressPercent);
             estimateBadge = new TextBlock();
             estimateBadge.Text = "ESTIMATE FROM VALIDATION BASELINE";
-            estimateBadge.FontSize = 9;
+            estimateBadge.FontSize = 12;
             estimateBadge.FontWeight = FontWeights.Bold;
             estimateBadge.Foreground = Teal;
             estimateBadge.HorizontalAlignment = HorizontalAlignment.Right;
@@ -341,7 +364,7 @@ namespace ResticBackuper.Dashboard
             StackPanel etaPanel = new StackPanel();
             etaTitle = new TextBlock();
             etaTitle.Text = "ESTIMATED TIME REMAINING";
-            etaTitle.FontSize = 10;
+            etaTitle.FontSize = 12;
             etaTitle.FontWeight = FontWeights.Bold;
             etaTitle.Foreground = MutedText;
             etaPanel.Children.Add(etaTitle);
@@ -354,7 +377,7 @@ namespace ResticBackuper.Dashboard
             etaPanel.Children.Add(etaValue);
             etaHint = new TextBlock();
             etaHint.Text = "Waiting for the first real snapshot";
-            etaHint.FontSize = 11;
+            etaHint.FontSize = 12;
             etaHint.Foreground = MutedText;
             etaHint.TextWrapping = TextWrapping.Wrap;
             etaPanel.Children.Add(etaHint);
@@ -365,7 +388,7 @@ namespace ResticBackuper.Dashboard
             schedule.Margin = new Thickness(0, 18, 0, 0);
             TextBlock scheduleText = new TextBlock();
             scheduleText.Text = "AUTOMATIC  •  02:00 DAILY";
-            scheduleText.FontSize = 10;
+            scheduleText.FontSize = 12;
             scheduleText.FontWeight = FontWeights.Bold;
             scheduleText.Foreground = Blue;
             schedule.Child = scheduleText;
@@ -387,15 +410,15 @@ namespace ResticBackuper.Dashboard
                 StackPanel step = new StackPanel();
                 step.HorizontalAlignment = HorizontalAlignment.Center;
                 Border marker = new Border();
-                marker.Width = 22;
-                marker.Height = 22;
-                marker.CornerRadius = new CornerRadius(11);
+                marker.Width = 26;
+                marker.Height = 26;
+                marker.CornerRadius = new CornerRadius(13);
                 marker.Background = BrushFrom("#25334A");
                 marker.BorderBrush = CardBorderBrush;
                 marker.BorderThickness = new Thickness(1);
                 TextBlock number = new TextBlock();
                 number.Text = (index + 1).ToString(CultureInfo.InvariantCulture);
-                number.FontSize = 9;
+                number.FontSize = 12;
                 number.FontWeight = FontWeights.Bold;
                 number.Foreground = MutedText;
                 number.HorizontalAlignment = HorizontalAlignment.Center;
@@ -405,7 +428,7 @@ namespace ResticBackuper.Dashboard
                 step.Children.Add(marker);
                 TextBlock label = new TextBlock();
                 label.Text = labels[index];
-                label.FontSize = 9;
+                label.FontSize = 12;
                 label.Foreground = MutedText;
                 label.Margin = new Thickness(0, 4, 0, 0);
                 label.HorizontalAlignment = HorizontalAlignment.Center;
@@ -449,7 +472,7 @@ namespace ResticBackuper.Dashboard
             StackPanel panel = new StackPanel();
             TextBlock heading = new TextBlock();
             heading.Text = title;
-            heading.FontSize = 9;
+            heading.FontSize = 12;
             heading.FontWeight = FontWeights.Bold;
             heading.Foreground = accent;
             panel.Children.Add(heading);
@@ -461,7 +484,7 @@ namespace ResticBackuper.Dashboard
             panel.Children.Add(value);
             TextBlock subtitle = new TextBlock();
             subtitle.Text = hint;
-            subtitle.FontSize = 9;
+            subtitle.FontSize = 12;
             subtitle.Foreground = MutedText;
             panel.Children.Add(subtitle);
             card.Child = panel;
@@ -472,11 +495,12 @@ namespace ResticBackuper.Dashboard
         private UIElement BuildSources()
         {
             Border card = CreateCard();
-            card.Padding = new Thickness(18, 13, 18, 11);
+            card.Padding = new Thickness(20, 17, 20, 15);
 
             Grid cardGrid = new Grid();
             cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            cardGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             cardGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
             Grid header = new Grid();
@@ -484,95 +508,186 @@ namespace ResticBackuper.Dashboard
             header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
             StackPanel heading = new StackPanel();
-            heading.Orientation = Orientation.Horizontal;
             TextBlock title = new TextBlock();
-            title.Text = "Backed-up folders";
-            title.FontSize = 15;
+            title.Text = "Protected folders";
+            title.FontSize = 18;
             title.FontWeight = FontWeights.SemiBold;
             title.Foreground = PrimaryText;
-            title.VerticalAlignment = VerticalAlignment.Center;
             heading.Children.Add(title);
 
             sourceSummary = new TextBlock();
             sourceSummary.Text = "Loading protected configuration...";
-            sourceSummary.FontSize = 10;
+            sourceSummary.FontSize = 12;
             sourceSummary.Foreground = MutedText;
-            sourceSummary.Margin = new Thickness(12, 3, 0, 0);
-            sourceSummary.VerticalAlignment = VerticalAlignment.Center;
+            sourceSummary.Margin = new Thickness(0, 3, 0, 0);
             heading.Children.Add(sourceSummary);
             header.Children.Add(heading);
 
-            StackPanel actions = new StackPanel();
-            actions.Orientation = Orientation.Horizontal;
             addSourceButton = CreateButton("Add folder");
-            addSourceButton.Background = BrushFrom("#153A3A");
-            addSourceButton.BorderBrush = BrushFrom("#25645F");
+            addSourceButton.Background = Teal;
+            addSourceButton.Foreground = BrushFrom("#07151D");
+            addSourceButton.BorderBrush = BrushFrom("#52D6C6");
+            addSourceButton.BorderThickness = new Thickness(1.5);
+            addSourceButton.MinHeight = 38;
+            addSourceButton.Padding = new Thickness(17, 8, 17, 8);
+            addSourceButton.FontSize = 13;
             addSourceButton.Click += OnAddSourceClick;
-            actions.Children.Add(addSourceButton);
-
-            removeSourceButton = CreateButton("Remove selected");
-            removeSourceButton.Margin = new Thickness(8, 0, 0, 0);
-            removeSourceButton.IsEnabled = false;
-            removeSourceButton.Click += OnRemoveSourceClick;
-            actions.Children.Add(removeSourceButton);
-            Grid.SetColumn(actions, 1);
-            header.Children.Add(actions);
+            AutomationProperties.SetName(addSourceButton, "Add a folder to future backups");
+            AutomationProperties.SetHelpText(
+                addSourceButton,
+                "Choose a folder and request administrator approval to protect it in future backups.");
+            Grid.SetColumn(addSourceButton, 1);
+            header.Children.Add(addSourceButton);
             cardGrid.Children.Add(header);
 
-            sourceGrid = CreateSourceGrid();
-            sourceGrid.Margin = new Thickness(0, 8, 0, 5);
-            sourceGrid.SelectionChanged += delegate { UpdateSourceButtons(); };
-            Grid.SetRow(sourceGrid, 1);
-            cardGrid.Children.Add(sourceGrid);
-
             sourceStatus = new TextBlock();
-            sourceStatus.Text = "Select a folder to remove it. Changes require Windows approval.";
-            sourceStatus.FontSize = 9;
+            sourceStatus.Text = "Administrator approval is required to change protected folders.";
+            sourceStatus.FontSize = 12;
             sourceStatus.Foreground = MutedText;
-            sourceStatus.TextTrimming = TextTrimming.CharacterEllipsis;
-            Grid.SetRow(sourceStatus, 2);
+            sourceStatus.TextWrapping = TextWrapping.Wrap;
+            sourceStatus.Margin = new Thickness(0, 9, 0, 0);
+            Grid.SetRow(sourceStatus, 1);
             cardGrid.Children.Add(sourceStatus);
 
+            sourceList = new StackPanel();
+            TextBlock loading = new TextBlock();
+            loading.Text = "Loading protected folders...";
+            loading.FontSize = 12;
+            loading.Foreground = MutedText;
+            loading.Margin = new Thickness(12, 14, 12, 14);
+            sourceList.Children.Add(loading);
+
+            ScrollViewer sourceScroller = new ScrollViewer();
+            sourceScroller.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+            sourceScroller.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+            sourceScroller.MaxHeight = 174;
+            sourceScroller.Content = sourceList;
+            AutomationProperties.SetName(sourceScroller, "Folders included in future backups");
+
+            Border sourceFrame = new Border();
+            sourceFrame.Background = CardSoftBrush;
+            sourceFrame.BorderBrush = CardBorderBrush;
+            sourceFrame.BorderThickness = new Thickness(1);
+            sourceFrame.CornerRadius = new CornerRadius(10);
+            sourceFrame.Padding = new Thickness(6);
+            sourceFrame.Margin = new Thickness(0, 11, 0, 0);
+            sourceFrame.Child = sourceScroller;
+            Grid.SetRow(sourceFrame, 2);
+            cardGrid.Children.Add(sourceFrame);
+
+            Border safety = new Border();
+            safety.Background = BrushFrom("#132638");
+            safety.BorderBrush = BrushFrom("#294157");
+            safety.BorderThickness = new Thickness(1);
+            safety.CornerRadius = new CornerRadius(8);
+            safety.Padding = new Thickness(11, 8, 11, 8);
+            safety.Margin = new Thickness(0, 10, 0, 0);
+            TextBlock safetyText = new TextBlock();
+            safetyText.Text = "Removing a folder stops future backups. Existing snapshots remain intact.";
+            safetyText.FontSize = 12;
+            safetyText.Foreground = BrushFrom("#B7C5D1");
+            safetyText.TextWrapping = TextWrapping.Wrap;
+            safety.Child = safetyText;
+            AutomationProperties.SetName(safety, safetyText.Text);
+            Grid.SetRow(safety, 3);
+            cardGrid.Children.Add(safety);
+
             card.Child = cardGrid;
+            AutomationProperties.SetName(card, "Protected folders");
             return card;
         }
 
-        private DataGrid CreateSourceGrid()
+        private UIElement BuildSourceRow(BackupSourceView source, int index, bool managerAvailable)
         {
-            DataGrid grid = new DataGrid();
-            grid.AutoGenerateColumns = false;
-            grid.IsReadOnly = true;
-            grid.CanUserAddRows = false;
-            grid.CanUserDeleteRows = false;
-            grid.CanUserResizeRows = false;
-            grid.HeadersVisibility = DataGridHeadersVisibility.Column;
-            grid.GridLinesVisibility = DataGridGridLinesVisibility.Horizontal;
-            grid.HorizontalGridLinesBrush = BrushFrom("#223149");
-            grid.VerticalGridLinesBrush = Brushes.Transparent;
-            grid.Background = Brushes.Transparent;
-            grid.Foreground = PrimaryText;
-            grid.BorderThickness = new Thickness(0);
-            grid.RowBackground = Brushes.Transparent;
-            grid.AlternatingRowBackground = BrushFrom("#0F1A2B");
-            grid.AlternationCount = 2;
-            grid.RowHeight = 28;
-            grid.SelectionMode = DataGridSelectionMode.Single;
-            grid.SelectionUnit = DataGridSelectionUnit.FullRow;
-            grid.SelectionBrushCompat(BrushFrom("#213D59"));
+            Border row = new Border();
+            row.Background = index % 2 == 0 ? BrushFrom("#101E2C") : BrushFrom("#0D1926");
+            row.BorderBrush = BrushFrom("#22384B");
+            row.BorderThickness = new Thickness(1);
+            row.CornerRadius = new CornerRadius(8);
+            row.Padding = new Thickness(11, 8, 9, 8);
+            row.Margin = new Thickness(0, 0, 0, 6);
+            row.ToolTip = source.SourcePath;
 
-            Style headerStyle = new Style(typeof(DataGridColumnHeader));
-            headerStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
-            headerStyle.Setters.Add(new Setter(Control.ForegroundProperty, MutedText));
-            headerStyle.Setters.Add(new Setter(Control.FontSizeProperty, 9.0));
-            headerStyle.Setters.Add(new Setter(Control.FontWeightProperty, FontWeights.Bold));
-            headerStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0, 0, 0, 1)));
-            headerStyle.Setters.Add(new Setter(Control.BorderBrushProperty, CardBorderBrush));
-            headerStyle.Setters.Add(new Setter(Control.PaddingProperty, new Thickness(5, 0, 5, 5)));
-            grid.ColumnHeaderStyle = headerStyle;
+            Grid grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
-            grid.Columns.Add(TextColumn("FOLDER PATH", "SourcePath", 4.2));
-            grid.Columns.Add(TextColumn("ROLE", "RoleLabel", 1.1));
-            return grid;
+            Ellipse marker = new Ellipse();
+            marker.Width = 9;
+            marker.Height = 9;
+            marker.Fill = source.IsProtectedCanary ? Blue : Green;
+            marker.Margin = new Thickness(0, 5, 10, 0);
+            marker.VerticalAlignment = VerticalAlignment.Top;
+            grid.Children.Add(marker);
+
+            StackPanel details = new StackPanel();
+            TextBlock name = new TextBlock();
+            name.Text = source.DisplayName;
+            name.FontSize = 13;
+            name.FontWeight = FontWeights.SemiBold;
+            name.Foreground = PrimaryText;
+            name.TextTrimming = TextTrimming.CharacterEllipsis;
+            details.Children.Add(name);
+
+            TextBlock path = new TextBlock();
+            path.Text = source.ShortPath;
+            path.FontSize = 12;
+            path.Foreground = MutedText;
+            path.TextTrimming = TextTrimming.CharacterEllipsis;
+            path.ToolTip = source.SourcePath;
+            path.Margin = new Thickness(0, 2, 10, 0);
+            details.Children.Add(path);
+            Grid.SetColumn(details, 1);
+            grid.Children.Add(details);
+
+            if (source.IsProtectedCanary)
+            {
+                Border required = new Border();
+                required.Background = BrushFrom("#172E43");
+                required.BorderBrush = BrushFrom("#3B5A70");
+                required.BorderThickness = new Thickness(1);
+                required.CornerRadius = new CornerRadius(12);
+                required.Padding = new Thickness(10, 5, 10, 5);
+                required.VerticalAlignment = VerticalAlignment.Center;
+                TextBlock requiredText = new TextBlock();
+                requiredText.Text = "Required";
+                requiredText.FontSize = 12;
+                requiredText.FontWeight = FontWeights.SemiBold;
+                requiredText.Foreground = Blue;
+                required.Child = requiredText;
+                AutomationProperties.SetName(required, "Required restore verification canary");
+                Grid.SetColumn(required, 2);
+                grid.Children.Add(required);
+            }
+            else
+            {
+                Button remove = CreateButton("Remove from future backups");
+                remove.Tag = source;
+                remove.Margin = new Thickness(10, 0, 0, 0);
+                remove.Padding = new Thickness(10, 6, 10, 6);
+                remove.MinHeight = 34;
+                remove.Background = BrushFrom("#2B1C2A");
+                remove.BorderBrush = BrushFrom("#7A3B4A");
+                remove.Foreground = BrushFrom("#FFB2BC");
+                remove.IsEnabled = managerAvailable && !sourceOperationInProgress;
+                remove.Click += OnRemoveSourceClick;
+                AutomationProperties.SetName(
+                    remove,
+                    "Remove " + source.DisplayName + " from future backups");
+                AutomationProperties.SetHelpText(
+                    remove,
+                    "Stops future backups of this folder. Existing snapshots remain intact.");
+                removeSourceButtons.Add(remove);
+                Grid.SetColumn(remove, 2);
+                grid.Children.Add(remove);
+            }
+
+            row.Child = grid;
+            AutomationProperties.SetName(
+                row,
+                source.DisplayName + ", " + source.SourcePath + ", " + source.RoleLabel);
+            return row;
         }
 
         private UIElement BuildHistory()
@@ -597,7 +712,7 @@ namespace ResticBackuper.Dashboard
             chartHeader.Children.Add(chartTitle);
             runCount = new TextBlock();
             runCount.Text = "0 RUNS";
-            runCount.FontSize = 9;
+            runCount.FontSize = 12;
             runCount.FontWeight = FontWeights.Bold;
             runCount.Foreground = MutedText;
             runCount.VerticalAlignment = VerticalAlignment.Center;
@@ -657,7 +772,7 @@ namespace ResticBackuper.Dashboard
             Style headerStyle = new Style(typeof(DataGridColumnHeader));
             headerStyle.Setters.Add(new Setter(Control.BackgroundProperty, Brushes.Transparent));
             headerStyle.Setters.Add(new Setter(Control.ForegroundProperty, MutedText));
-            headerStyle.Setters.Add(new Setter(Control.FontSizeProperty, 9.0));
+            headerStyle.Setters.Add(new Setter(Control.FontSizeProperty, 12.0));
             headerStyle.Setters.Add(new Setter(Control.FontWeightProperty, FontWeights.Bold));
             headerStyle.Setters.Add(new Setter(Control.BorderThicknessProperty, new Thickness(0, 0, 0, 1)));
             headerStyle.Setters.Add(new Setter(Control.BorderBrushProperty, CardBorderBrush));
@@ -730,33 +845,18 @@ namespace ResticBackuper.Dashboard
             try
             {
                 SourceConfiguration configuration = SourceConfiguration.Load();
+                bool managerAvailable = File.Exists(configuration.ManagerPath);
                 string signature = string.Join(
                     "\u001f",
                     configuration.Sources.Select(source =>
-                        (source.IsProtectedCanary ? "canary:" : "user:") + source.SourcePath).ToArray());
-                string selectedPath = null;
-                BackupSourceView selected = sourceGrid.SelectedItem as BackupSourceView;
-                if (selected != null)
-                {
-                    selectedPath = selected.SourcePath;
-                }
+                        (source.IsProtectedCanary ? "canary:" : "user:") + source.SourcePath).ToArray()) +
+                    "\u001fmanager:" + (managerAvailable ? "1" : "0");
 
                 currentSourceConfiguration = configuration;
                 if (force || !string.Equals(signature, sourceSignature, StringComparison.Ordinal))
                 {
                     sourceSignature = signature;
-                    sourceGrid.ItemsSource = configuration.Sources.ToList();
-                    if (selectedPath != null)
-                    {
-                        foreach (BackupSourceView item in configuration.Sources)
-                        {
-                            if (string.Equals(item.SourcePath, selectedPath, StringComparison.OrdinalIgnoreCase))
-                            {
-                                sourceGrid.SelectedItem = item;
-                                break;
-                            }
-                        }
-                    }
+                    RebuildSourceList(configuration, managerAvailable);
                 }
 
                 int userSources = configuration.Sources.Count(source => !source.IsProtectedCanary);
@@ -767,19 +867,14 @@ namespace ResticBackuper.Dashboard
 
                 if (DateTime.UtcNow >= sourceNoticeExpiresUtc)
                 {
-                    if (!File.Exists(configuration.ManagerPath))
+                    if (!managerAvailable)
                     {
                         sourceStatus.Text = "Folder management is unavailable because the protected manager is missing.";
                         sourceStatus.Foreground = Rose;
                     }
-                    else if (hasCanarySource)
-                    {
-                        sourceStatus.Text = "The protected canary verifies restores and cannot be removed.";
-                        sourceStatus.Foreground = MutedText;
-                    }
                     else
                     {
-                        sourceStatus.Text = "Select a folder to remove it. Changes require Windows approval.";
+                        sourceStatus.Text = "Administrator approval is required to change protected folders.";
                         sourceStatus.Foreground = MutedText;
                     }
                 }
@@ -788,7 +883,14 @@ namespace ResticBackuper.Dashboard
             {
                 currentSourceConfiguration = null;
                 sourceSignature = null;
-                sourceGrid.ItemsSource = null;
+                removeSourceButtons.Clear();
+                sourceList.Children.Clear();
+                TextBlock unavailable = new TextBlock();
+                unavailable.Text = "Protected folders are temporarily unavailable.";
+                unavailable.FontSize = 12;
+                unavailable.Foreground = Rose;
+                unavailable.Margin = new Thickness(12, 14, 12, 14);
+                sourceList.Children.Add(unavailable);
                 sourceSummary.Text = "Protected configuration unavailable";
                 if (DateTime.UtcNow >= sourceNoticeExpiresUtc)
                 {
@@ -799,23 +901,31 @@ namespace ResticBackuper.Dashboard
             UpdateSourceButtons();
         }
 
+        private void RebuildSourceList(SourceConfiguration configuration, bool managerAvailable)
+        {
+            sourceList.Children.Clear();
+            removeSourceButtons.Clear();
+            for (int index = 0; index < configuration.Sources.Count; index++)
+            {
+                sourceList.Children.Add(BuildSourceRow(configuration.Sources[index], index, managerAvailable));
+            }
+        }
+
         private void UpdateSourceButtons()
         {
             bool managerAvailable = currentSourceConfiguration != null &&
                 File.Exists(currentSourceConfiguration.ManagerPath);
-            BackupSourceView selected = sourceGrid == null
-                ? null
-                : sourceGrid.SelectedItem as BackupSourceView;
             if (addSourceButton != null)
             {
                 addSourceButton.IsEnabled = !sourceOperationInProgress && managerAvailable;
             }
-            if (removeSourceButton != null)
+            foreach (Button removeButton in removeSourceButtons)
             {
-                removeSourceButton.IsEnabled = !sourceOperationInProgress &&
+                BackupSourceView source = removeButton.Tag as BackupSourceView;
+                removeButton.IsEnabled = !sourceOperationInProgress &&
                     managerAvailable &&
-                    selected != null &&
-                    !selected.IsProtectedCanary;
+                    source != null &&
+                    !source.IsProtectedCanary;
             }
         }
 
@@ -853,26 +963,111 @@ namespace ResticBackuper.Dashboard
             {
                 return;
             }
-            BackupSourceView selected = sourceGrid.SelectedItem as BackupSourceView;
+            Button removeButton = sender as Button;
+            BackupSourceView selected = removeButton == null
+                ? null
+                : removeButton.Tag as BackupSourceView;
             if (selected == null || selected.IsProtectedCanary)
             {
                 SetSourceNotice("The protected restore canary cannot be removed.", Amber, 8);
                 return;
             }
 
-            MessageBoxResult confirmation = MessageBox.Show(
-                this,
-                "Stop backing up this folder in future runs?\n\n" + selected.SourcePath +
-                    "\n\nExisting Restic snapshots are not deleted by this action.",
-                "Remove backed-up folder",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning,
-                MessageBoxResult.No);
-            if (confirmation != MessageBoxResult.Yes)
+            if (!ConfirmSourceRemoval(selected))
             {
                 return;
             }
             await ApplySourceChange("Remove", selected.SourcePath);
+        }
+
+        private bool ConfirmSourceRemoval(BackupSourceView source)
+        {
+            Window dialog = new Window();
+            dialog.Title = "Remove folder from future backups?";
+            dialog.Owner = this;
+            dialog.Width = 530;
+            dialog.SizeToContent = SizeToContent.Height;
+            dialog.ResizeMode = ResizeMode.NoResize;
+            dialog.WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            dialog.ShowInTaskbar = false;
+            dialog.Background = BackgroundTop;
+            dialog.Foreground = PrimaryText;
+            dialog.FontFamily = FontFamily;
+
+            Border frame = new Border();
+            frame.Background = CardBrush;
+            frame.BorderBrush = CardBorderBrush;
+            frame.BorderThickness = new Thickness(1);
+            frame.Padding = new Thickness(24, 22, 24, 20);
+
+            StackPanel content = new StackPanel();
+            TextBlock title = new TextBlock();
+            title.Text = "Remove folder from future backups?";
+            title.FontSize = 20;
+            title.FontWeight = FontWeights.SemiBold;
+            title.Foreground = PrimaryText;
+            content.Children.Add(title);
+
+            TextBlock warning = new TextBlock();
+            warning.Text = "Removing a folder stops future backups. Existing snapshots remain intact.";
+            warning.FontSize = 13;
+            warning.Foreground = BrushFrom("#B7C5D1");
+            warning.TextWrapping = TextWrapping.Wrap;
+            warning.Margin = new Thickness(0, 8, 0, 16);
+            content.Children.Add(warning);
+
+            Border folder = new Border();
+            folder.Background = CardSoftBrush;
+            folder.BorderBrush = CardBorderBrush;
+            folder.BorderThickness = new Thickness(1);
+            folder.CornerRadius = new CornerRadius(8);
+            folder.Padding = new Thickness(13, 10, 13, 10);
+            StackPanel folderDetails = new StackPanel();
+            TextBlock folderName = new TextBlock();
+            folderName.Text = source.DisplayName;
+            folderName.FontSize = 14;
+            folderName.FontWeight = FontWeights.SemiBold;
+            folderName.Foreground = PrimaryText;
+            folderDetails.Children.Add(folderName);
+            TextBlock folderPath = new TextBlock();
+            folderPath.Text = source.SourcePath;
+            folderPath.FontSize = 12;
+            folderPath.Foreground = MutedText;
+            folderPath.TextWrapping = TextWrapping.Wrap;
+            folderPath.Margin = new Thickness(0, 3, 0, 0);
+            folderDetails.Children.Add(folderPath);
+            folder.Child = folderDetails;
+            content.Children.Add(folder);
+
+            StackPanel actions = new StackPanel();
+            actions.Orientation = Orientation.Horizontal;
+            actions.HorizontalAlignment = HorizontalAlignment.Right;
+            actions.Margin = new Thickness(0, 19, 0, 0);
+
+            Button keep = CreateButton("Keep folder");
+            keep.MinHeight = 36;
+            keep.IsCancel = true;
+            keep.Click += delegate { dialog.DialogResult = false; };
+            AutomationProperties.SetName(keep, "Keep folder");
+            actions.Children.Add(keep);
+
+            Button remove = CreateButton("Remove from future backups");
+            remove.Margin = new Thickness(10, 0, 0, 0);
+            remove.MinHeight = 36;
+            remove.Background = Rose;
+            remove.BorderBrush = BrushFrom("#FF9AAA");
+            remove.Foreground = BrushFrom("#201016");
+            remove.Click += delegate { dialog.DialogResult = true; };
+            AutomationProperties.SetName(remove, "Remove from future backups");
+            AutomationProperties.SetHelpText(remove, warning.Text);
+            actions.Children.Add(remove);
+            content.Children.Add(actions);
+
+            frame.Child = content;
+            dialog.Content = frame;
+            AutomationProperties.SetName(dialog, "Remove folder from future backups");
+            bool? result = dialog.ShowDialog();
+            return result.HasValue && result.Value;
         }
 
         private async Task ApplySourceChange(string action, string sourcePath)
@@ -1366,9 +1561,28 @@ namespace ResticBackuper.Dashboard
             button.BorderBrush = CardBorderBrush;
             button.BorderThickness = new Thickness(1);
             button.Padding = new Thickness(13, 7, 13, 7);
-            button.FontSize = 11;
+            button.FontSize = 12;
             button.FontWeight = FontWeights.SemiBold;
+            button.MinHeight = 34;
             button.Cursor = Cursors.Hand;
+            AutomationProperties.SetName(button, label);
+            Brush borderBeforeFocus = null;
+            Thickness thicknessBeforeFocus = new Thickness(1);
+            button.GotKeyboardFocus += delegate
+            {
+                borderBeforeFocus = button.BorderBrush;
+                thicknessBeforeFocus = button.BorderThickness;
+                button.BorderBrush = Blue;
+                button.BorderThickness = new Thickness(2);
+            };
+            button.LostKeyboardFocus += delegate
+            {
+                if (borderBeforeFocus != null)
+                {
+                    button.BorderBrush = borderBeforeFocus;
+                    button.BorderThickness = thicknessBeforeFocus;
+                }
+            };
             return button;
         }
 
@@ -1418,7 +1632,7 @@ namespace ResticBackuper.Dashboard
         {
             Style style = new Style(typeof(TextBlock));
             style.Setters.Add(new Setter(TextBlock.ForegroundProperty, new SolidColorBrush((Color)ColorConverter.ConvertFromString("#D7E1EF"))));
-            style.Setters.Add(new Setter(TextBlock.FontSizeProperty, 10.0));
+            style.Setters.Add(new Setter(TextBlock.FontSizeProperty, 12.0));
             style.Setters.Add(new Setter(TextBlock.VerticalAlignmentProperty, VerticalAlignment.Center));
             style.Setters.Add(new Setter(TextBlock.PaddingProperty, new Thickness(5, 0, 5, 0)));
             column.ElementStyle = style;
