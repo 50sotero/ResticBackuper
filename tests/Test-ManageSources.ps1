@@ -173,19 +173,33 @@ function Stop-ManagerAtBoundary {
     $script:childProcesses.Add($process)
 
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    while (-not (Test-Path -LiteralPath $sentinel -PathType Leaf) -and [DateTime]::UtcNow -lt $deadline) {
+    $sentinelText = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
         $process.Refresh()
         if ($process.HasExited) { break }
+        if (Test-Path -LiteralPath $sentinel -PathType Leaf) {
+            try {
+                # CreateNew makes the name visible before the child has written
+                # and flushed its content. Wait for the exact record rather
+                # than treating mere path visibility as the durable boundary.
+                $candidateText = [IO.File]::ReadAllText($sentinel, [Text.Encoding]::UTF8)
+                if ($candidateText.Trim() -ceq $Boundary) {
+                    $sentinelText = $candidateText
+                    break
+                }
+            }
+            catch [IO.IOException] { }
+        }
         Start-Sleep -Milliseconds 50
     }
-    if (-not (Test-Path -LiteralPath $sentinel -PathType Leaf)) {
+    if ($null -eq $sentinelText) {
         $outText = if (Test-Path -LiteralPath $stdout) { Get-Content -LiteralPath $stdout -Raw } else { '' }
         $errText = if (Test-Path -LiteralPath $stderr) { Get-Content -LiteralPath $stderr -Raw } else { '' }
         $process.Refresh()
         $exitDescription = if ($process.HasExited) { [string]$process.ExitCode } else { 'still-running' }
-        throw "Child did not reach $Boundary within 30 seconds. exit=$exitDescription stdout=$outText stderr=$errText"
+        throw "Child did not durably reach $Boundary within 30 seconds. exit=$exitDescription stdout=$outText stderr=$errText"
     }
-    Assert-True -Condition ((Get-Content -LiteralPath $sentinel -Raw).Trim() -ceq $Boundary) `
+    Assert-True -Condition ($sentinelText.Trim() -ceq $Boundary) `
         -Message "$Boundary sentinel was durably written with the exact boundary"
     $process.Refresh()
     Assert-True -Condition (-not $process.HasExited) -Message "child is demonstrably alive at $Boundary before forced termination"
