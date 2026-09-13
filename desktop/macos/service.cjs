@@ -359,6 +359,9 @@ class MacBackupService extends EventEmitter {
 
   async backupNow() {
     if (this._state.status.active) throw new Error('A backup is already running.');
+    // Scheduled backups must replace a presentation preview, including when
+    // preflight later fails, so the UI always shows the real operation state.
+    if (this._state.preview) this._setState({ preview: false });
     await this._ensureConfigured();
     if (!this._config || !this._config.sources.length) throw new Error('Choose at least one folder before starting a backup.');
     await this._validateConfiguredPaths();

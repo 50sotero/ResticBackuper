@@ -475,9 +475,12 @@ test('backup cancellation sends SIGINT to the active Restic child and records a 
   const root = await tempDir('rewindle-cancel-');
   const runner = fakeResticRunner({ root, keepBackupOpen: true });
   const { service } = await makeConfiguredService(root, runner);
+  await service.execute('togglePreview');
+  assert.equal(service.getState().preview, true);
   const running = service.execute('backupNow');
   for (let i = 0; i < 30 && !runner.calls.some((call) => call.args[2] === 'backup'); i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(runner.calls.some((call) => call.args[2] === 'backup'));
+  assert.equal(service.getState().preview, false, 'a real backup must replace the presentation preview');
   await service.execute('cancelBackup');
   const state = await running;
   assert.equal(state.status.cancelled, true);

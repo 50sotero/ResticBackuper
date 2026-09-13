@@ -291,7 +291,7 @@ export default function App() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [page, send]);
-  if (!state) return <div className="connection-screen"><img src="./rewindle-icon.svg" alt="" width="48" height="48" /><LoadingState label="Opening Rewindle" variant="Orbit" /><p>{window.chrome?.webview ? 'Loading your protected folders, backup history, and repository status.' : 'Open the desktop app to connect to your backup state.'}</p></div>;
+  if (!state) return <div className="connection-screen"><img src="./rewindle-icon.svg" alt="" width="48" height="48" /><LoadingState label="Opening Rewindle" variant="Orbit" /><p>{(window.rewindleNative ?? window.chrome?.webview) ? 'Loading your protected folders, backup history, and repository status.' : 'Open the desktop app to connect to your backup state.'}</p></div>;
   const recents = [...state.history].sort((a, b) => Date.parse(b.started) - Date.parse(a.started)).slice(0, 8).map(run => ({ id: run.id, label: `${run.startedDisplay} · ${run.result}` }));
   return <MotionConfig reducedMotion={state.reducedMotion ? 'always' : 'user'}><div className="app-shell">
     <a className="skip-link" href="#main-content" onClick={event => { event.preventDefault(); pageRef.current?.focus(); }}>Skip to content</a>

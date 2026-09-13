@@ -56,6 +56,7 @@ jobs:
           test -n "$(find desktop/dist -maxdepth 1 -name '*.dmg' -print -quit)"
           shasum -a 256 desktop/dist/*.dmg desktop/dist/*.zip > desktop/dist/SHA256SUMS-macos-${{ matrix.arch }}.txt
       - name: Upload macOS installers and smoke evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}

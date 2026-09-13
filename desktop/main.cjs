@@ -24,6 +24,11 @@ const APP_ID = 'com.rewindle.desktop';
 const VERSION = '0.2.0-alpha.1';
 const PAGES = new Set(['Protection', 'Activity', 'Restore', 'Settings']);
 const THEMES = new Set(['System', 'Midnight', 'Daylight']);
+const PREVIEW_PROTECTED_COMMANDS = new Set([
+  'backupNow', 'cancelBackup', 'addSource', 'removeSource', 'editSchedule',
+  'changeRepository', 'repairRepository', 'reviewChanges', 'openRestore',
+  'checkReadiness', 'retrySourceChange',
+]);
 const COMMANDS = new Set([
   'ready', 'refresh', 'navigate', 'setTheme', 'togglePreview',
   'backupNow', 'cancelBackup', 'addSource', 'removeSource', 'editSchedule',
@@ -764,6 +769,9 @@ async function sendState() {
 }
 
 async function executeCommand(command, payload) {
+  if (PREVIEW_PROTECTED_COMMANDS.has(command) && (await service.getState()).preview) {
+    throw new Error('Stop the animation preview before using this action.');
+  }
   if (command === 'openRestore' && !payload.destination) return openRestoreFlow();
   if (command === 'viewRunDetails') return showRunDetails(payload.runId);
   if (command === 'togglePreview') {
@@ -953,7 +961,7 @@ async function runSmokeTest() {
     })`, true);
     checks.push({ name: 'preload-ipc', ok: ipcResult === true });
     const navigation = await mainWindow.webContents.executeJavaScript(`new Promise((resolve) => {
-      const expected = ['Activity', 'Settings', 'Protection'];
+      const expected = ['Activity', 'Restore', 'Settings', 'Protection'];
       let index = 0;
       const clickNext = () => {
         const button = [...document.querySelectorAll('button')].find((candidate) => candidate.getAttribute('aria-label') === expected[index] || candidate.textContent.trim() === expected[index]);
@@ -1020,6 +1028,24 @@ async function runSmokeTest() {
       ok: previewLabelled && previewAdvanced,
       details: preview,
     });
+
+    const renderedPreview = await mainWindow.webContents.executeJavaScript(`new Promise((resolve) => {
+      const started = Date.now();
+      const check = () => {
+        const progress = document.querySelector('[role="progressbar"][aria-label="Preview backup progress"]');
+        const actions = [...document.querySelectorAll('.page .section-head .actions button')];
+        const sample = {
+          progress: Number(progress && progress.getAttribute('aria-valuenow')),
+          protectedActionsDisabled: actions.length >= 2 && actions.every((button) => button.disabled),
+          title: document.querySelector('.status-title')?.textContent || '',
+        };
+        if ((sample.progress > 0 && sample.protectedActionsDisabled) || Date.now() - started > 4000) resolve(sample);
+        else setTimeout(check, 100);
+      };
+      check();
+    })`, true);
+    checks.push({ name: 'rendered-preview', ok: renderedPreview.progress > 0 && renderedPreview.protectedActionsDisabled
+      && renderedPreview.title === 'Animation preview', details: renderedPreview });
 
     if (preview && preview.ok) {
       try {
