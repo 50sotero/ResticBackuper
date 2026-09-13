@@ -23,6 +23,24 @@ async function tempDir(prefix) {
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
+test('Restic waits for pipe closure before returning the final snapshot summary', async () => {
+  const root = await tempDir('rewindle-pipe-close-');
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  const service = new MacBackupService({ platform: 'darwin', dataDir: root, resticPath: path.join(root, 'restic'), spawnProcess: () => child });
+  let resolved = false;
+  const result = service._runRestic(['-r', root, 'backup']).then(value => { resolved = true; return value; });
+  child.emit('exit', 0, null);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(resolved, false, 'the process exit event must not discard unread stdout');
+  child.stdout.end('{"message_type":"summary","snapshot_id":"abc12345"}\n');
+  child.stderr.end();
+  child.emit('close', 0, null);
+  assert.match((await result).stdout, /abc12345/);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 function uiFixture(root, answers = {}) {
   const calls = [];
   return {

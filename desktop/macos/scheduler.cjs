@@ -116,7 +116,6 @@ function waitForChild(child) {
       reject(error);
     });
     child.once?.('close', (code, signal) => done({ code: Number.isInteger(code) ? code : 1, signal }));
-    child.once?.('exit', (code, signal) => done({ code: Number.isInteger(code) ? code : 1, signal }));
   });
 }
 

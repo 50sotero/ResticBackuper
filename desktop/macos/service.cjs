@@ -1077,8 +1077,8 @@ class MacBackupService extends EventEmitter {
       };
       child.once?.('error', fail);
       child.once?.('close', (code, signal) => finish({ code: Number.isInteger(code) ? code : 1, signal }));
-      // Small test runners may expose an exit event but not close.
-      child.once?.('exit', (code, signal) => finish({ code: Number.isInteger(code) ? code : 1, signal }));
+      // Wait for close: exit can arrive before stdout has delivered the final
+      // JSON summary, including the immutable snapshot ID.
     });
   }
 
