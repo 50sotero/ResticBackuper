@@ -75,7 +75,7 @@ class ResticReadError(RuntimeError):
 
 
 def _normalized_windows_path(path: Path | str) -> str:
-    return ntpath.normcase(ntpath.normpath(ntpath.abspath(str(path))))
+    return canonical_path(path)
 
 
 def _is_within_windows_path(candidate: Path | str, parent: Path | str) -> bool:
@@ -370,7 +370,31 @@ def volume_serial(path: Path) -> str:
 
 
 def canonical_path(path: Path | str) -> str:
-    return ntpath.normcase(ntpath.normpath(ntpath.abspath(str(path))))
+    # This recovery entrypoint is copied into a standalone bundle; keep its
+    # DOS-alias comparison independent of the installed restic_common module.
+    absolute = ntpath.normpath(ntpath.abspath(str(path)))
+    if os.name != "nt":
+        return ntpath.normcase(absolute)
+    get_long_path = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+    get_long_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    get_long_path.restype = ctypes.c_uint32
+    candidate = absolute
+    suffix: list[str] = []
+    while True:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_long_path(candidate, buffer, len(buffer))
+        if 0 < length < len(buffer):
+            return ntpath.normcase(ntpath.normpath(ntpath.join(buffer.value, *reversed(suffix))))
+        if length >= len(buffer):
+            raise ValueError("Windows path exceeds the supported length")
+        error = ctypes.get_last_error()
+        if error not in (2, 3, 15, 21, 53, 67, 123, 161):
+            raise ctypes.WinError(error)
+        parent, leaf = ntpath.split(candidate)
+        if not leaf or parent == candidate:
+            return ntpath.normcase(absolute)
+        suffix.append(leaf)
+        candidate = parent
 
 
 def windows_snapshot_path(path: Path) -> str:
@@ -383,11 +407,11 @@ def windows_snapshot_path(path: Path) -> str:
 
 
 def select_configured_source(requested: Path, configured: list[str]) -> Path:
-    requested_text = ntpath.normcase(ntpath.abspath(str(requested)))
+    requested_text = canonical_path(requested)
     matches = [
         Path(source)
         for source in configured
-        if ntpath.normcase(ntpath.abspath(source)) == requested_text
+        if canonical_path(source) == requested_text
     ]
     if len(matches) != 1:
         raise ValueError("--source must exactly match one source recorded in backup-config.json")

@@ -152,8 +152,8 @@ def atomic_write_json(path: Path, value: Any) -> None:
 
 
 def _is_within(candidate: Path, parent: Path) -> bool:
-    child_text = ntpath.normcase(ntpath.abspath(str(candidate)))
-    parent_text = ntpath.normcase(ntpath.abspath(str(parent)))
+    child_text = _normalized_windows_path(candidate)
+    parent_text = _normalized_windows_path(parent)
     try:
         return ntpath.commonpath([child_text, parent_text]) == parent_text
     except ValueError:
@@ -161,8 +161,34 @@ def _is_within(candidate: Path, parent: Path) -> bool:
 
 
 def canonical_windows_path(path: str | Path) -> str:
-    """Return a stable, lexical Windows path without requiring it to exist."""
-    return ntpath.normpath(ntpath.abspath(str(path)))
+    """Expand existing DOS aliases without following junctions or requiring a leaf."""
+    import ctypes
+
+    absolute = ntpath.normpath(ntpath.abspath(str(path)))
+    if os.name != "nt":
+        return absolute
+    get_long_path = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+    get_long_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+    get_long_path.restype = ctypes.c_uint32
+    candidate = absolute
+    suffix: list[str] = []
+    while True:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = get_long_path(candidate, buffer, len(buffer))
+        if 0 < length < len(buffer):
+            return ntpath.normpath(ntpath.join(buffer.value, *reversed(suffix)))
+        if length >= len(buffer):
+            raise ValueError("Windows path exceeds the supported length")
+        error = ctypes.get_last_error()
+        # Missing/offline paths retain lexical names for preflight to diagnose.
+        # Access failures must not silently bypass an alias comparison.
+        if error not in (2, 3, 15, 21, 53, 67, 123, 161):
+            raise ctypes.WinError(error)
+        parent, leaf = ntpath.split(candidate)
+        if not leaf or parent == candidate:
+            return absolute
+        suffix.append(leaf)
+        candidate = parent
 
 
 def _normalized_windows_path(path: str | Path) -> str:

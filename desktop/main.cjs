@@ -1038,7 +1038,6 @@ async function runSmokeTest() {
     if (preview && preview.sawPreview) {
       stopped = await mainWindow.webContents.executeJavaScript(`new Promise((resolve) => {
         let done = false;
-        let sawPreview = false;
         const finish = (value) => {
           if (done) return;
           done = true;
@@ -1048,11 +1047,7 @@ async function runSmokeTest() {
         const onMessage = (event) => {
           const next = event && event.data && event.data.state;
           if (!next) return;
-          if (next.preview) {
-            sawPreview = true;
-            return;
-          }
-          if (sawPreview) {
+          if (!next.preview) {
             finish({
               ok: true,
               preview: false,

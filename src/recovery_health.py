@@ -27,6 +27,7 @@ from refresh_recovery_tools import (
 )
 from restic_common import (
     DRIVE_FIXED,
+    canonical_windows_path,
     validate_repository_volume,
     windows_volume_metadata,
 )
@@ -85,8 +86,8 @@ def parse_recovery_key(path: Path, repository: Path) -> str:
     passwords = re.findall(r"^Password:\s*(\S+)\s*$", text, flags=re.MULTILINE)
     if len(repositories) != 1 or len(passwords) != 1 or len(passwords[0]) < 40:
         raise RuntimeError("The recovery key does not contain one valid repository/password pair.")
-    expected = ntpath.normcase(ntpath.normpath(str(repository)))
-    recorded = ntpath.normcase(ntpath.normpath(repositories[0]))
+    expected = ntpath.normcase(canonical_windows_path(repository))
+    recorded = ntpath.normcase(canonical_windows_path(repositories[0]))
     if recorded != expected:
         raise RuntimeError("The recovery key names a different repository.")
     return passwords[0]

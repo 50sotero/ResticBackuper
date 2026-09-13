@@ -18,6 +18,7 @@ sys.path.insert(0, str(SOURCE))
 import backup
 import dry_run
 import restic_common
+import recovery_health
 import restore
 import secret_store
 
@@ -131,6 +132,45 @@ class CoreSafetyTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "(?:repository and source|source and repository) overlap"):
                 restic_common.load_config(config_path, require_repository=False)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows DOS path aliases")
+    def test_short_path_aliases_cannot_bypass_repository_guards(self) -> None:
+        import ctypes
+
+        with tempfile.TemporaryDirectory(prefix="resticbackuper-path-alias-") as root_text:
+            root = Path(root_text).resolve()
+            get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+            get_short_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            get_short_path.restype = ctypes.c_uint32
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_short_path(str(root), buffer, len(buffer))
+            self.assertGreater(length, 0)
+            alias = Path(buffer.value)
+            if str(alias).casefold() == str(root).casefold():
+                self.skipTest("temporary volume has DOS alias generation disabled")
+
+            source = root / "source"
+            source.mkdir()
+            alias_source = alias / "source"
+            self.assertEqual(str(source), restic_common.canonical_windows_path(alias_source))
+            self.assertEqual(
+                str(source / "not-created" / "report.json"),
+                restic_common.canonical_windows_path(alias_source / "not-created" / "report.json"),
+            )
+            config_path = self._write_config(
+                root, repository=source / "repository", sources=[alias_source],
+            )
+            with self.assertRaisesRegex(ValueError, "source and repository.*overlap"):
+                restic_common.load_config(config_path, require_repository=False)
+            self.assertTrue(restore.is_within(alias_source / "report.json", source))
+            self.assertTrue(restore._is_within_windows_path(alias_source, source))
+            self.assertEqual(
+                source, restore.select_configured_source(alias_source, [str(source)]),
+            )
+            key = root / "separate-recovery.txt"
+            password = "test-fixture-" + "x" * 40
+            key.write_text(f"Repository: {alias_source}\nPassword: {password}\n", encoding="utf-8")
+            self.assertEqual(password, recovery_health.parse_recovery_key(key, source))
 
     def test_load_config_rejects_unsafe_exclusion(self) -> None:
         with tempfile.TemporaryDirectory(prefix="resticbackuper-exclude-") as root_text:
