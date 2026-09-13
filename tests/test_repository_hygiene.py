@@ -168,6 +168,9 @@ class RepositoryHygieneTests(unittest.TestCase):
         allowed_binary_assets = {
             "src/dashboard/assets/dashboard-icon.ico",
             "src/dashboard/assets/dashboard-icon.png",
+            "brand/app-icon.ico",
+            "brand/app-icon.png",
+            "brand/social-card.png",
         }
         findings: list[str] = []
         for path in self.files:

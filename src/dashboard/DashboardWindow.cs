@@ -226,6 +226,11 @@ namespace ResticBackuper.Dashboard
             this.reader = new TelemetryReader(
                 options.StateDirectory,
                 !options.UseIsolatedPresentationStore);
+            if (options.UseIsolatedPresentationStore)
+            {
+                DashboardThemeManager.IsolatedSettingsRoot = Path.Combine(
+                    Path.GetTempPath(), "ResticBackuperPresentationSettings");
+            }
             this.themeResolution = DashboardThemeManager.LoadAndResolve();
             this.themePreference = this.themeResolution.Preference;
 
@@ -5810,7 +5815,7 @@ namespace ResticBackuper.Dashboard
             TimeSpan eta = TimeSpan.FromSeconds(Math.Max(20, elapsed.TotalSeconds * (1 - fraction) / Math.Max(0.02, fraction)));
 
             heroTitle.Text = "Previewing live backup telemetry";
-            heroDetail.Text = "Clearly labeled simulation using your verified validation baseline.";
+            heroDetail.Text = "Preview how backup progress moves through each stage. No backup is running.";
             progressPercent.Text = (fraction * 100).ToString("0.0", CultureInfo.CurrentCulture) + "%";
             estimateBadge.Text = "PREVIEW  •  ESTIMATED FROM VALIDATION";
             estimateBadge.Foreground = Amber;

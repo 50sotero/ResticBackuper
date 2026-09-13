@@ -335,6 +335,7 @@ namespace ResticBackuper.Dashboard
             @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
 
         private static readonly object SettingsSync = new object();
+        internal static string IsolatedSettingsRoot;
         private static readonly DashboardThemePalette MidnightPalette =
             new DashboardThemePalette(CreateMidnightDefinition());
         private static readonly DashboardThemePalette DaylightPalette =
@@ -669,7 +670,7 @@ namespace ResticBackuper.Dashboard
         {
             try
             {
-                string localApplicationData = Environment.GetFolderPath(
+                string localApplicationData = IsolatedSettingsRoot ?? Environment.GetFolderPath(
                     Environment.SpecialFolder.LocalApplicationData);
                 if (string.IsNullOrWhiteSpace(localApplicationData))
                 {
@@ -695,7 +696,7 @@ namespace ResticBackuper.Dashboard
         {
             try
             {
-                string localApplicationData = Environment.GetFolderPath(
+                string localApplicationData = IsolatedSettingsRoot ?? Environment.GetFolderPath(
                     Environment.SpecialFolder.LocalApplicationData);
                 if (string.IsNullOrWhiteSpace(localApplicationData))
                 {

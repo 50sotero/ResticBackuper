@@ -1,0 +1,97 @@
+name: Desktop installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Install pinned desktop dependencies
+        run: npm ci
+      - name: Build the shared Beautiful UI frontend
+        run: npm run prepare-web
+      - name: Fetch and verify the macOS Restic binary
+        run: npm run fetch-restic -- --arch ${{ matrix.arch }}
+      - name: Verify backup service and real Restic recovery
+        env:
+          PROOFHOLD_REAL_RESTIC: "1"
+        run: |
+          export PROOFHOLD_RESTIC_PATH="$PWD/desktop/vendor/restic/${{ matrix.arch }}/restic"
+          node --test tests/macos-service.test.cjs tests/macos-restic.integration.test.cjs
+      - name: Build disk image and application archive
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist:mac -- --${{ matrix.arch }}
+      - name: Smoke-test the real desktop bridge
+        run: |
+          PACKAGED_APP="$(find desktop/dist -maxdepth 3 -name '*.app' -print -quit)"
+          test -n "$PACKAGED_APP"
+          npm run smoke-test -- --app "$PACKAGED_APP" --output desktop/dist/smoke-test.json
+      - name: Verify packaged app and write checksums
+        run: |
+          test -n "$(find desktop/dist -maxdepth 1 -name '*.dmg' -print -quit)"
+          shasum -a 256 desktop/dist/*.dmg desktop/dist/*.zip > desktop/dist/SHA256SUMS-macos-${{ matrix.arch }}.txt
+      - name: Upload macOS installers and smoke evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            desktop/dist/*.dmg
+            desktop/dist/*.zip
+            desktop/dist/SHA256SUMS-*.txt
+            desktop/dist/smoke-test.json
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+      - name: Run isolated backend and hygiene checks
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+      - name: Build the Windows payload and setup installer
+        shell: pwsh
+        run: .\build\Build-Release.ps1
+      - name: Verify real backup and independent restore
+        shell: pwsh
+        run: .\tests\Test-ReleaseArtifact.ps1
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-x64
+          if-no-files-found: error
+          path: |
+            artifacts/*.exe
+            artifacts/*.zip
+            artifacts/*SHA256*
+            artifacts/*sha256*

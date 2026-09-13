@@ -22,6 +22,11 @@ artifacts/
 tools/
 **/dist/
 **/build-output/
+**/node_modules/
+**/.packages/
+*.dmg
+*.pkg
+*.blockmap
 *.exe
 *.dll
 *.pdb
