@@ -515,7 +515,11 @@ class MacBackupService extends EventEmitter {
     } catch (error) {
       this._config = previousConfig;
       try {
-        await this.scheduler.installDailyLaunchAgent({ time: previousConfig.schedule.time });
+        if (previousConfig.schedule.enabled) {
+          await this.scheduler.installDailyLaunchAgent({ time: previousConfig.schedule.time });
+        } else if (typeof this.scheduler.removeDailyLaunchAgent === 'function') {
+          await this.scheduler.removeDailyLaunchAgent();
+        }
       } catch {
         // Keep the old in-memory configuration and surface the write failure.
       }
