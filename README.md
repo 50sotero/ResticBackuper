@@ -1,26 +1,32 @@
-# ResticBackuper
+# Proofhold
 
-Verified, encrypted, incremental Windows backups powered by Restic.
+Backup you can verify.
 
-ResticBackuper turns a careful Restic setup into a guided Windows package. It
-adds VSS capture for open files, a daily Task Scheduler job, a live read-only
-telemetry dashboard, UAC-protected source-folder management, protected local
-credentials, and verification that includes a real canary restore.
+Proofhold is a desktop backup app for Windows and macOS, powered by Restic. It
+turns a careful repository setup into a guided workflow with an inspectable
+dashboard, encrypted incremental snapshots, and verification that includes a
+real canary restore. The same animated dashboard is shared by both desktop
+shells and uses the literal Beautiful UI components and motion primitives
+recorded in [`src/dashboard/web/vendor/UPSTREAM.md`](src/dashboard/web/vendor/UPSTREAM.md).
+
+The public product name is Proofhold. Existing Windows task names, executable
+names, install paths, and recovery files retain their `ResticBackuper` names so
+existing protected state and operational tooling remain compatible.
 
 > [!WARNING]
-> **v0.1.0-alpha.8 is an early public test release.** Its installer and
-> executables are not code-signed, and the project has not yet been validated
-> across a broad range of Windows machines. Test it with non-critical data and
-> an independent restore target before relying on it. Keep another backup while
-> you evaluate it.
+> **v0.2.0-alpha.1 is an early public test release.** The Windows and macOS
+> installers are not signed or notarized, and the project has not yet been
+> validated across a broad range of machines. Test it with non-critical data
+> and an independent restore target before relying on it. Keep another backup
+> while you evaluate it.
 
-## How the creator uses it
+## How it works
 
-ResticBackuper grew out of a real nightly Windows backup routine. The protected
-set includes software projects, cloud-synchronized working folders, Codex
-configuration and home data, and ordinary personal folders. Dependency trees,
-caches, and build outputs that can be reproduced from source and lockfiles are
-excluded, so the backup concentrates on original work and irreplaceable data.
+Proofhold grew out of a real nightly backup routine. Select the folders and
+repository explicitly, then use the dashboard to see the last verified run,
+repository checks, canary evidence, and restore history. The app does not
+silently choose a cloud destination or claim that a local repository is an
+off-site copy.
 
 Each run writes an encrypted, incremental snapshot to the explicitly selected
 Restic repository. A successful status also requires repository checks and a
@@ -132,11 +138,13 @@ restore tests appropriate to your own threat model.
 - Preserves the repository, recovery material, and run history when the app is
   uninstalled.
 
-ResticBackuper does not automatically prune snapshots or delete repository
-data. The repository will therefore grow until you deliberately introduce and
-test a retention policy.
+Proofhold does not automatically prune snapshots or delete repository data.
+The repository will therefore grow until you deliberately introduce and test a
+retention policy.
 
 ## Requirements
+
+### Windows
 
 - 64-bit Windows 10 or Windows 11
 - Windows PowerShell 5.1 and .NET Framework 4.8. The installer checks these
@@ -155,28 +163,49 @@ test a retention policy.
 - Enough free space for the first full snapshot (the installer requires at
   least 10 GiB by default)
 
-The release contains pinned Windows x64 builds of Restic 0.19.1 and the Python
-3.14.6 embeddable runtime. A separate Python or Restic installation is not
-required.
+### macOS
 
-## Install the alpha
+- A supported Apple Silicon or Intel Mac running a current macOS release
+  that can run the matching Electron build.
+- A local folder repository and source folders that the app can access after
+  macOS privacy approval. Network and provider-specific repositories are not
+  part of this alpha's supported contract.
+- A login session for the user launchd schedule. The schedule runs as the
+  installing user and does not require administrator privileges.
+- Enough free space for the first full snapshot and an empty destination for
+  every restore. Restic 0.19.1 is bundled or staged by the release build;
+  a separate Restic installation is not required.
 
-1. Download the Windows x64 ZIP and its `.sha256` file from
+The Windows release contains pinned x64 builds of Restic 0.19.1 and the
+Python 3.14.6 embeddable runtime. The macOS release contains the matching
+Electron desktop shell and stages the official Restic 0.19.1 arm64 or x64
+binary after verifying the pinned SHA-256 manifest. A separate Python or
+Restic installation is not required for either packaged app.
+
+## Install the Windows alpha
+
+1. Download the Windows x64 ZIP, the `-setup.exe` bootstrapper, and their
+   adjacent `.sha256` files from
    [GitHub Releases](https://github.com/50sotero/ResticBackuper/releases).
 2. Verify the download before extracting it:
 
    ```powershell
-   Get-FileHash .\ResticBackuper-v0.1.0-alpha.8-windows-x64.zip -Algorithm SHA256
-   Get-Content .\ResticBackuper-v0.1.0-alpha.8-windows-x64.zip.sha256
+   Get-FileHash .\Proofhold-v0.2.0-alpha.1-windows-x64.zip -Algorithm SHA256
+   Get-Content .\Proofhold-v0.2.0-alpha.1-windows-x64.zip.sha256
+   Get-FileHash .\Proofhold-v0.2.0-alpha.1-windows-x64-setup.exe -Algorithm SHA256
+   Get-Content .\Proofhold-v0.2.0-alpha.1-windows-x64-setup.exe.sha256
    ```
 
-   The two SHA-256 values must match exactly.
-3. Extract the ZIP to a normal local directory. Review the included scripts if
-   you wish; this is a transparent script-based installer, not an opaque
-   bootstrap executable.
-4. Double-click `Install.cmd`. Choose the repository, source folders, and daily
-   schedule. VSS and the dashboard are enabled by default; advanced flags can
-   disable either. Approve UAC with the same Windows account.
+   Each computed value must match the corresponding published checksum.
+3. Either extract the ZIP to a normal local directory and review the included
+   scripts, then double-click `Install.cmd`, or run the setup executable. The
+   setup executable embeds the same verified ZIP and launches the existing
+   reviewed PowerShell installer; it does not replace that installer with an
+   opaque packaging framework. If WebView2 is missing, the setup flow obtains
+   Microsoft's signed WebView2 bootstrapper before opening the dashboard.
+4. Choose the repository, source folders, and daily schedule. VSS and the
+   dashboard are enabled by default; advanced flags can disable either.
+   Approve UAC with the same Windows account.
 5. Move the generated `ResticBackuper-RecoveryKey.txt` to a password manager,
    encrypted removable storage, or another secure offline location. Do not
    leave the only copy on the computer being backed up.
@@ -191,6 +220,30 @@ required.
 The first backup may take a long time. Later runs reuse Restic's stored data,
 but Restic still needs to inspect the selected sources to determine what
 changed.
+
+## Install the macOS alpha
+
+Download the arm64 build for Apple Silicon or the x64 build for an Intel Mac:
+
+```text
+Proofhold-0.2.0-alpha.1-arm64.dmg
+Proofhold-0.2.0-alpha.1-arm64.zip
+Proofhold-0.2.0-alpha.1-x64.dmg
+Proofhold-0.2.0-alpha.1-x64.zip
+```
+
+Open the DMG and move Proofhold to Applications, or extract the ZIP. macOS may
+ask for privacy access to selected source folders. The first setup selects a
+local repository and source folders, generates an encrypted repository
+password through the macOS keychain-backed safe-storage facility, and offers a
+separate recovery-key export. Store that recovery key offline before relying
+on the repository.
+
+The macOS app performs real Restic initialization, backup, repository check,
+canary restore, snapshot browsing, and verified restore to a new or empty
+destination. The daily schedule is a per-user launchd job. It does not use the
+Windows VSS, UAC, DPAPI, DriveFS cloud-proof, repository-migration, or advanced
+repair workflows; those capabilities remain Windows-specific in this alpha.
 
 ### Google Drive storage modes
 
@@ -288,7 +341,7 @@ Windows ACLs:
   --target 'X:\Restored-Documents'
 ```
 
-## Where files live
+## Where files live on Windows
 
 | Purpose | Default location |
 | --- | --- |
@@ -309,6 +362,12 @@ in place.
 This alpha does not support an in-place upgrade; uninstall the old application
 binaries, confirm that the protected data remains, and then install the newer
 release.
+
+On macOS, the Electron application is installed in Applications. User data,
+the encrypted password envelope, recovery evidence, and launchd schedule live
+under the app's per-user application-data directory. The repository stays at
+the path selected during setup. Uninstalling the app does not delete that
+repository or recovery material.
 
 ## Safety and transparency
 
@@ -355,10 +414,12 @@ release.
 - Restore targets must be new or empty and cannot overlap a configured source
   or the repository.
 
-There is no code signature in this alpha. Windows SmartScreen or antivirus may
-therefore warn about the downloaded scripts and executables. Verify the release
-checksum, review the source, and proceed only if you trust it. Do not disable
-security controls globally to make the installation run.
+The Windows artifacts are not Authenticode-signed, and the macOS artifacts are
+not Developer ID signed or notarized in this alpha. Windows SmartScreen or
+antivirus and macOS Gatekeeper may therefore warn about the downloaded
+artifacts. Verify the release checksums, review the source, and proceed only if
+you trust it. Do not disable security controls globally to make the
+installation run.
 
 See [`docs/architecture.md`](docs/architecture.md) for the data flow and trust
 boundaries, [`SECURITY.md`](SECURITY.md) for reporting vulnerabilities, and
@@ -366,11 +427,12 @@ boundaries, [`SECURITY.md`](SECURITY.md) for reporting vulnerabilities, and
 
 ## Build from source
 
-Release builds are produced with Windows PowerShell 5.1 and .NET Framework 4.8
-tooling on 64-bit Windows. The build verifies and stages
-the pinned Python and Restic dependencies, compiles the native Windows
-launcher and WPF dashboard with .NET Framework 4.8 tooling, generates a
-payload manifest, and creates the distributable ZIP plus checksum.
+The Windows release build runs with Windows PowerShell 5.1 and .NET Framework
+4.8 tooling on 64-bit Windows. It verifies and stages the pinned Python and
+Restic dependencies, compiles the native launcher and WPF dashboard, bundles
+the shared web UI, generates a payload manifest, and creates the distributable
+ZIP, setup executable, and checksums. The setup executable embeds the ZIP and
+uses the reviewed PowerShell installer already exercised by the ZIP flow.
 
 The ZIP writer normalizes package entry metadata, but the legacy .NET Framework
 C# compiler can emit nondeterministic executable bytes. Builds from the same
@@ -383,12 +445,31 @@ is not a reproducible-build claim.
 .\tests\Test-ReleaseArtifact.ps1
 ```
 
+The macOS build runs on a Mac runner for each architecture. From `desktop/`:
+
+```bash
+npm ci
+npm run prepare-web
+npm run fetch-restic -- --arch arm64
+npm run dist:mac -- --arm64
+npm run fetch-restic -- --arch x64
+npm run dist:mac -- --x64
+```
+
+The architecture-specific commands produce the DMG and ZIP under
+`desktop/dist/`. `npm run smoke-test -- --output desktop/dist/smoke-test.json`
+starts the real Electron host against the built React dashboard and exercises
+the preload IPC bridge with the real macOS service. Release CI uses `macos-15`
+for arm64 and `macos-15-intel` for x64; signing and notarization credentials
+are intentionally not assumed by this alpha.
+
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting a change. In
 particular, never commit real paths, usernames, hostnames, volume serials,
 logs, repositories, DPAPI envelopes, or recovery keys.
 
 ## License
 
-ResticBackuper is available under the [MIT License](LICENSE). Release bundles
-also contain Restic under the BSD 2-Clause License and Python under the Python
-Software Foundation License and its accompanying notices.
+Proofhold is available under the [MIT License](LICENSE). Release bundles also
+contain Restic under the BSD 2-Clause License, Python under the Python Software
+Foundation License and its accompanying notices, and the web and Electron
+runtime notices described in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

@@ -1,9 +1,28 @@
 # Architecture
 
-This document describes ResticBackuper v0.1.0-alpha.8 for Windows x64. The
-design wraps Restic with conservative validation, Windows scheduling and VSS,
-local telemetry, and a recovery workflow. Restic remains the component that
-creates, encrypts, deduplicates, and restores repository snapshots.
+This document describes Proofhold v0.2.0-alpha.1 for Windows x64 and macOS
+arm64/x64. The product uses one shared React dashboard inside two native
+desktop shells. The Windows implementation retains the `ResticBackuper`
+executable, task, and protected-state identifiers for compatibility. Restic
+remains the component that creates, encrypts, deduplicates, and restores
+repository snapshots.
+
+## Shared dashboard and motion
+
+The dashboard is a real application surface shared by the Windows WebView2
+host and the macOS Electron host. It incorporates the literal Beautiful UI
+components pinned in [`src/dashboard/web/vendor/UPSTREAM.md`](../src/dashboard/web/vendor/UPSTREAM.md),
+including the navigation rail, task rows, filter table, insight cards, context
+cards, loading states, and their source keyframes. The integration keeps the
+upstream DOM structure and interaction motion while connecting those elements
+to the real backup, restore, schedule, and readiness state.
+
+React Motion supplies page transitions, staggered content, expandable-row
+feedback, and reduced-motion handling. Liveline renders the activity trend
+without inventing backup state. The web bundle contains no default remote demo
+video or network-backed backup data: animation is decorative and every status,
+snapshot, and action comes from the native host contract. Upstream provenance
+and the required MIT notice are kept beside the copied source.
 
 ## Runtime flow
 
@@ -53,6 +72,30 @@ exclusion set. When configured, Restic asks Windows VSS for filesystem
 snapshots of local fixed NTFS sources so open files can be read from a
 consistent view.
 
+## macOS runtime flow
+
+The macOS shell uses Electron with context isolation, a sandboxed renderer,
+and a narrow preload bridge. Renderer commands are allowlisted and validated
+before they reach the main process; the renderer cannot spawn a process, read
+arbitrary files, or navigate to an arbitrary URL. Native folder and save
+dialogs stay in the main process.
+
+`desktop/macos/service.cjs` drives the pinned Restic 0.19.1 binary with a
+temporary `RESTIC_PASSWORD_FILE`. The repository password is encrypted with
+macOS safe storage and is never placed in a command argument or ordinary
+dashboard state. Setup initializes a local folder repository, records exact
+source folders, and offers a separate recovery-key export. A backup emits
+JSON progress, then requires a complete snapshot summary, `restic check`, a
+canary restore, and a content hash check before publishing success.
+
+Restore browsing lists real repository snapshots and projected entries. A
+restore request carries an immutable snapshot ID and optional path, selects a
+new or empty destination, rejects overlap with sources or the repository, and
+uses Restic verification. Cancellation sends the child a cooperative signal;
+it does not delete snapshots or repair a repository. The schedule adapter
+writes a per-user launchd agent and rolls back its prior job if persistence or
+launchd bootstrap fails.
+
 ## Successful-run criteria
 
 A Restic process exit code alone does not mark a run successful. The wrapper
@@ -75,6 +118,10 @@ restores of representative user data remain essential.
 
 ## Components
 
+The following table describes the Windows protected runtime. The executable
+and task names are intentionally still `ResticBackuper` inside the branded
+Proofhold release.
+
 | Component | Responsibility | Write scope |
 | --- | --- | --- |
 | `ResticBackuperTaskLauncher.exe` | Supervises the scheduled Python/Restic process and ties descendants to a kill-on-close job object | None directly |
@@ -90,6 +137,19 @@ restores of representative user data remain essential.
 | `DiagnosticExporter.cs` | Builds a bounded support ZIP after removing secrets, identities, host names, command lines, and personal paths | User-selected diagnostic ZIP only |
 | Google Drive verifier | Holds the protected run lock, compares the sole DriveFS repository with a read-only API inventory, and restores the canary through a direct cloud backend | Protected verification runs/evidence only; no repository writes |
 | Installer/uninstaller | Installs protected runtime, creates tasks and shortcuts, manages application binaries | Program Files, ProgramData, Task Scheduler, registry, chosen repository during initialization |
+
+### macOS host components
+
+| Component | Responsibility | Write scope |
+| --- | --- | --- |
+| Electron main process and preload bridge | Creates the native window, owns dialogs, enforces the IPC command allowlist, and routes state updates to the shared dashboard | Per-user app data and explicit dialog destinations |
+| `desktop/macos/service.cjs` | Initializes and drives real Restic backups, checks, canary restores, snapshot browsing, verified restores, cancellation, and recovery-key export | Selected local repository, explicit restore target, encrypted password envelope, bounded status/history |
+| `desktop/macos/scheduler.cjs` | Installs and removes the per-user daily launchd agent with transactional rollback | User LaunchAgents entry and schedule state |
+| Bundled Restic 0.19.1 | Creates encrypted snapshots, checks the repository, and restores selected content | Selected local repository and explicit restore target |
+
+The macOS shell does not expose the Windows VSS, UAC, DPAPI, DriveFS cloud
+proof, repository-migration, or advanced repair managers. The dashboard hides
+those actions instead of presenting controls that the host cannot honor.
 
 ## On-disk boundaries
 
@@ -182,15 +242,20 @@ stale. Legacy local-mirror status is explicitly rejected.
 
 ## Installer and supply chain
 
-The public alpha is distributed as a transparent ZIP, not a bootstrap
-executable. It embeds pinned Windows x64 releases of Python 3.14.6 and Restic
-0.19.1 so installation does not execute an unpinned network download.
+The public Windows alpha is distributed as both a transparent ZIP and a
+Proofhold setup executable. The setup executable embeds the same ZIP and
+launches the existing reviewed PowerShell installer; it does not introduce a
+second installer implementation. Both paths embed pinned Windows x64 releases
+of Python 3.14.6 and Restic 0.19.1, so installation does not execute an
+unpinned Restic or Python download. If WebView2 is missing, the setup flow
+downloads Microsoft's signed WebView2 bootstrapper and verifies that the
+runtime is available before opening the dashboard.
 
-The release build verifies the upstream archive hashes recorded in
+The Windows release build verifies the upstream archive hashes recorded in
 `dependencies.json`, verifies the extracted Restic executable hash, and emits
-a checksum for the final ZIP. The installer validates every staged payload
-file against its own path, size, and SHA-256 manifest before copying it into
-the protected runtime.
+checksums for the ZIP and setup executable. The installer validates every
+staged payload file against its own path, size, and SHA-256 manifest before
+copying it into the protected runtime.
 
 ZIP entry metadata is normalized, but the legacy .NET Framework C# compiler can
 emit nondeterministic executable bytes. Rebuilding the same source is therefore
@@ -198,11 +263,19 @@ not guaranteed to reproduce the release ZIP byte for byte. The published
 SHA-256 identifies the exact frozen release artifact; it is an integrity value,
 not a reproducible-build claim.
 
-This is integrity checking, not publisher authentication. v0.1.0-alpha.8 has
-no Authenticode code signature, so users must obtain the checksum from the
-project's GitHub release, compare it locally, and decide whether they trust the
-project. A signed graphical installer is a future distribution goal, not a
-property of this alpha.
+This is integrity checking, not publisher authentication. v0.2.0-alpha.1 has
+no Authenticode signature on Windows and no Developer ID signature or
+notarization on macOS. Users must obtain checksums from the project's GitHub
+release, compare them locally, and decide whether they trust the project.
+Signing credentials are deliberately not required by the alpha build.
+
+The macOS build runs `npm ci`, builds the shared dashboard, downloads the
+official Restic 0.19.1 archive for the requested arm64 or x64 architecture,
+checks it against `desktop/scripts/restic-SHA256SUMS.txt` and the pinned
+manifest, then uses electron-builder to produce a DMG and ZIP. The final app
+bundle includes the Electron runtime notices and the web dependency notices.
+Smoke testing invokes the real service and preload bridge against a temporary
+fixture; it does not fall back to demo backup data.
 
 ## Installation and privilege model
 
@@ -385,3 +458,14 @@ a failure; the request itself is never treated as proof that a backup stopped.
   file mix, cache state, and storage speed change.
 - Canary verification is deliberately narrow and does not replace full or
   sampled user-file restore drills.
+- On macOS, only local folder repositories and local source folders are in the
+  supported contract. The release provides arm64 and Intel x64 builds, but the
+  app does not claim Windows VSS semantics, administrator/UAC elevation,
+  Windows DPAPI recovery, DriveFS cloud-proof, repository migration, or the
+  advanced Windows repair flows.
+- macOS launchd scheduling is per-user and requires a logged-in user session.
+  It is not a system daemon and does not prove that a Mac is online or that a
+  remote storage provider has synchronized the repository.
+- The shared dashboard's motion and charts are presentation layers. They do
+  not turn an in-progress operation into a success; the native service's
+  verified state remains authoritative.

@@ -271,12 +271,12 @@ class RepositoryHygieneTests(unittest.TestCase):
         )
 
         self.assertIn(f"**v{version} is an early public test release.**", readme)
-        self.assertIn(f"ResticBackuper-v{version}-windows-x64.zip", readme)
-        self.assertIn(f"ResticBackuper v{version} for Windows x64", architecture)
+        self.assertIn(f"Proofhold-v{version}-windows-x64.zip", readme)
+        self.assertIn(f"Proofhold v{version} for Windows x64", architecture)
         self.assertTrue(release_notes.is_file(), f"missing {release_notes.name}")
         self.assertTrue(
             release_notes.read_text(encoding="utf-8").startswith(
-                f"# ResticBackuper v{version}\n"
+                f"# Proofhold v{version}\n"
             )
         )
 
