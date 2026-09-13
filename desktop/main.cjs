@@ -182,10 +182,10 @@ function animationPreviewStatus(source) {
   const elapsed = (Date.now() - previewStartedAt) % PREVIEW_LOOP_MS;
   const clearValues = {
     runId: '',
-    files: '—',
-    bytes: '—',
-    speed: '—',
-    elapsed: '—',
+    files: 'â€”',
+    bytes: 'â€”',
+    speed: 'â€”',
+    elapsed: 'â€”',
     errors: '0',
     etaTitle: 'Preview timeline',
   };
@@ -205,7 +205,7 @@ function animationPreviewStatus(source) {
       phaseLabel: 'Done',
       progress: 1,
       estimated: false,
-      eta: '—',
+      eta: 'â€”',
       etaHint: '',
     };
   }
@@ -567,7 +567,7 @@ async function showRunDetails(runId) {
   postNativeMessage({ type: 'state', state: nextState });
   await showText({
     title: 'Backup run details',
-    message: `${safeText(run.type, 'Backup run')} · ${safeText(run.result, 'Result unavailable')}`,
+    message: `${safeText(run.type, 'Backup run')} Â· ${safeText(run.result, 'Result unavailable')}`,
     detail: formatRunDetails(run),
   });
   return { ok: true, state: nextState, message: 'Run details opened.' };
@@ -583,7 +583,7 @@ function normalizeRestoreSnapshotList(value) {
     const display = safeText(entry.startedDisplay || entry.display || entry.time || entry.started);
     const result = safeText(entry.result, 'Verified');
     const files = safeText(entry.filesDisplay || entry.files);
-    const label = [display || id, result, files ? `${files} files` : ''].filter(Boolean).join(' · ');
+    const label = [display || id, result, files ? `${files} files` : ''].filter(Boolean).join(' Â· ');
     return { id, label: label.slice(0, 260) };
   }).filter(Boolean).filter((entry, index, all) => all.findIndex((candidate) => candidate.id === entry.id) === index).slice(0, 200);
 }
@@ -614,7 +614,7 @@ async function restorePaths(snapshotId) {
     const item = safeText(entry.path || entry.value);
     const kind = /^(dir|directory)$/i.test(safeText(entry.type)) ? 'Folder' : 'File';
     const label = safeText(entry.label, safeText(entry.name, item));
-    return item ? { value: item, label: `${kind} · ${label}`.slice(0, 260) } : null;
+    return item ? { value: item, label: `${kind} Â· ${label}`.slice(0, 260) } : null;
   }).filter(Boolean).slice(0, 500);
 }
 
@@ -677,7 +677,7 @@ async function openRestoreFlow() {
   if (!destination) return { ok: true, message: 'Restore cancelled.' };
   const confirmed = await confirm({
     title: 'Restore these files?',
-    message: `Snapshot ${snapshotId.slice(0, 12)}… will be restored to ${destination}.`,
+    message: `Snapshot ${snapshotId.slice(0, 12)}â€¦ will be restored to ${destination}.`,
     detail: pathValue ? `Selected path: ${pathValue}` : 'The full verified snapshot will be restored.',
     confirmLabel: 'Restore and verify',
   });
@@ -858,7 +858,7 @@ async function createMainWindow() {
     height: 820,
     minWidth: 960,
     minHeight: 640,
-    title: `${PRODUCT_NAME} — ${TAGLINE}`,
+    title: `${PRODUCT_NAME} â€” ${TAGLINE}`,
     icon: fs.existsSync(icon) ? icon : undefined,
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#141821' : '#f7f8fb',
     show: false,
@@ -947,8 +947,8 @@ async function runSmokeTest() {
       let done = false;
       const finish = (value) => { if (!done) { done = true; resolve(value); } };
       const onMessage = (event) => { if (event && event.data && event.data.type === 'state') finish(true); };
-      window.chrome.webview.addEventListener('message', onMessage);
-      window.chrome.webview.postMessage({ type: 'command', id: 'smoke-ipc', command: 'ready' });
+      window.rewindleNative.addEventListener('message', onMessage);
+      window.rewindleNative.postMessage({ type: 'command', id: 'smoke-ipc', command: 'ready' });
       setTimeout(() => finish(false), 4000);
     })`, true);
     checks.push({ name: 'preload-ipc', ok: ipcResult === true });
@@ -984,7 +984,7 @@ async function runSmokeTest() {
       const finish = (value) => {
         if (done) return;
         done = true;
-        window.chrome.webview.removeEventListener('message', onMessage);
+        window.rewindleNative.removeEventListener('message', onMessage);
         resolve(value);
       };
       const onMessage = (event) => {
@@ -1007,8 +1007,8 @@ async function runSmokeTest() {
           finish({ ok: true, sawPreview, first, latest: sample, elapsedMs: Date.now() - startedAt });
         }
       };
-      window.chrome.webview.addEventListener('message', onMessage);
-      window.chrome.webview.postMessage({ type: 'command', id: 'smoke-preview-start', command: 'togglePreview' });
+      window.rewindleNative.addEventListener('message', onMessage);
+      window.rewindleNative.postMessage({ type: 'command', id: 'smoke-preview-start', command: 'togglePreview' });
       setTimeout(() => finish({ ok: false, sawPreview, message: 'Animation preview did not advance within 6 seconds.' }), 6000);
     })`, true);
     const previewLabelled = Boolean(preview && preview.first && preview.first.title === 'Animation preview'
@@ -1041,7 +1041,7 @@ async function runSmokeTest() {
         const finish = (value) => {
           if (done) return;
           done = true;
-          window.chrome.webview.removeEventListener('message', onMessage);
+          window.rewindleNative.removeEventListener('message', onMessage);
           resolve(value);
         };
         const onMessage = (event) => {
@@ -1057,8 +1057,8 @@ async function runSmokeTest() {
             });
           }
         };
-        window.chrome.webview.addEventListener('message', onMessage);
-        window.chrome.webview.postMessage({ type: 'command', id: 'smoke-preview-stop', command: 'togglePreview' });
+        window.rewindleNative.addEventListener('message', onMessage);
+        window.rewindleNative.postMessage({ type: 'command', id: 'smoke-preview-stop', command: 'togglePreview' });
         setTimeout(() => finish({ ok: false, message: 'Animation preview did not stop within 4 seconds.' }), 4000);
       })`, true);
     }

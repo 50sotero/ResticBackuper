@@ -8,7 +8,7 @@ export function useDashboard() {
   const lastMessage = useRef(0);
   const sequence = useRef(0);
   const send = useCallback((command: CommandName, payload?: Record<string, string | boolean>) => {
-    const native = window.chrome?.webview;
+    const native = window.rewindleNative ?? window.chrome?.webview;
     if (!native) { setNotice({ text: 'Open the desktop app to use backup controls.', error: true }); return; }
     if (command !== 'ready' && command !== 'refresh' && lastMessage.current && Date.now() - lastMessage.current > 15000) {
       setNotice({ text: 'The dashboard has lost its connection. Refresh before changing your backup plan.', error: true });
@@ -17,7 +17,7 @@ export function useDashboard() {
     native.postMessage({ type: 'command', id: String(++sequence.current), command, payload });
   }, []);
   useEffect(() => {
-    const native = window.chrome?.webview;
+    const native = window.rewindleNative ?? window.chrome?.webview;
     if (!native) return;
     const receive = (event: MessageEvent<NativeMessage>) => {
       const message = event.data;

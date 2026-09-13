@@ -50,7 +50,9 @@ const webview = Object.freeze({
   },
 });
 
-contextBridge.exposeInMainWorld('chrome', Object.freeze({ webview }));
+// Chromium owns window.chrome. Expose our narrow API under a product-owned
+// property instead of replacing that built-in namespace.
+contextBridge.exposeInMainWorld('rewindleNative', webview);
 
 contextBridge.exposeInMainWorld('rewindleModal', Object.freeze({
   onInit(listener) {

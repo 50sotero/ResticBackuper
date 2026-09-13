@@ -40,4 +40,4 @@ export interface NativeWebView {
   addEventListener(type: 'message', listener: (event: MessageEvent<NativeMessage>) => void): void;
   removeEventListener(type: 'message', listener: (event: MessageEvent<NativeMessage>) => void): void;
 }
-declare global { interface Window { chrome?: { webview?: NativeWebView } } }
+declare global { interface Window { chrome?: { webview?: NativeWebView }; rewindleNative?: NativeWebView } }
