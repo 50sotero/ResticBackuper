@@ -16,6 +16,11 @@ const smokeRoot = process.env.REWINDLE_SMOKE_DATA_DIR || mkdtempSync(path.join(o
 const userData = process.env.REWINDLE_USER_DATA || path.join(smokeRoot, 'user-data');
 const dataDir = process.env.REWINDLE_DATA_DIR || path.join(smokeRoot, 'state');
 fs.mkdirSync(path.dirname(output), { recursive: true });
+fs.mkdirSync(userData, { recursive: true, mode: 0o700 });
+const seededTheme = !process.env.REWINDLE_USER_DATA;
+if (seededTheme) {
+  fs.writeFileSync(path.join(userData, 'presentation.json'), `${JSON.stringify({ theme: 'Midnight' })}\n`, { encoding: 'utf8', mode: 0o600 });
+}
 
 function packagedExecutable(value) {
   if (!value) return null;
@@ -28,6 +33,7 @@ function detectPackagedApp() {
   if (process.platform !== 'darwin') return null;
   const architecture = process.arch === 'arm64' ? 'arm64' : 'x64';
   const candidates = [
+    path.join(root, 'desktop', 'dist', architecture === 'arm64' ? 'mac-arm64' : 'mac', 'Rewindle.app'),
     path.join(root, 'desktop', 'dist', `mac-${architecture}-unpacked`, 'Rewindle.app'),
     path.join(root, 'desktop', 'dist', 'mac-unpacked', 'Rewindle.app'),
   ];
@@ -42,7 +48,13 @@ const appExecutable = packagedExecutable(requestedApp || detectPackagedApp());
 const binary = appExecutable || require('electron');
 const child = spawn(binary, appExecutable ? ['--smoke-test', output] : ['.', '--smoke-test', output], {
   cwd: root,
-  env: { ...process.env, ELECTRON_ENABLE_LOGGING: '1', REWINDLE_USER_DATA: userData, REWINDLE_DATA_DIR: dataDir },
+  env: {
+    ...process.env,
+    ELECTRON_ENABLE_LOGGING: '1',
+    REWINDLE_USER_DATA: userData,
+    REWINDLE_DATA_DIR: dataDir,
+    REWINDLE_SMOKE_EXPECT_THEME: seededTheme ? 'Midnight' : '',
+  },
   stdio: 'inherit',
 });
 child.on('error', (error) => {

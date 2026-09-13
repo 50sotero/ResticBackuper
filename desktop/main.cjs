@@ -53,6 +53,7 @@ let navigationConfigured = false;
 let coreInitialized = false;
 let scheduledConsumed = false;
 let quitRequested = false;
+let presentationTheme = 'System';
 const smokeDiagnostics = [];
 const activeModals = new Map();
 const PREVIEW_LOOP_MS = 16_000;
@@ -143,12 +144,18 @@ async function persistTheme(theme) {
   const temporary = `${file}.${process.pid}.tmp`;
   await fsp.writeFile(temporary, `${JSON.stringify({ theme: normalized }, null, 2)}\n`, { mode: 0o600 });
   await fsp.rename(temporary, file);
+  presentationTheme = normalized;
   setNativeTheme(normalized);
 }
 
 function applyPresentation(state) {
   if (!state || typeof state !== 'object') return state;
-  const theme = normalizeTheme(state.theme || readPresentation().theme);
+  // Core starts with its portable System default.  The host-owned presentation
+  // file is the source of truth for the user's saved choice until a live
+  // dashboard theme command updates both values; no synthetic core write is
+  // needed during boot.
+  const coreTheme = normalizeTheme(state.theme);
+  const theme = coreTheme === 'System' ? presentationTheme : coreTheme;
   const dark = theme === 'Midnight' || (theme === 'System' && nativeTheme.shouldUseDarkColors);
   let animationSettings = null;
   try {
@@ -914,6 +921,7 @@ function startStateHeartbeat(delay = 5000) {
 
 async function runSmokeTest() {
   const checks = [];
+  let smokePreviewPath = null;
   try {
     if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Smoke window was not created.');
     const frontendLoaded = await mainWindow.webContents.executeJavaScript(`new Promise((resolve) => {
@@ -929,6 +937,12 @@ async function runSmokeTest() {
     checks.push({ name: 'frontend-render', ok: frontendLoaded === true });
     const state = await currentState();
     checks.push({ name: 'core-get-state', ok: isObject(state) && typeof state.status === 'object' });
+    const expectedTheme = safeText(process.env.REWINDLE_SMOKE_EXPECT_THEME);
+    checks.push({
+      name: 'presentation-theme',
+      ok: !expectedTheme || state.theme === expectedTheme,
+      details: { expected: expectedTheme || 'any persisted theme', actual: state.theme },
+    });
     const ipcResult = await mainWindow.webContents.executeJavaScript(`new Promise((resolve) => {
       let done = false;
       const finish = (value) => { if (!done) { done = true; resolve(value); } };
@@ -961,16 +975,140 @@ async function runSmokeTest() {
       clickNext();
     })`, true);
     checks.push({ name: 'frontend-navigation', ok: navigation === true });
+
+    const preview = await mainWindow.webContents.executeJavaScript(`new Promise((resolve) => {
+      let done = false;
+      let sawPreview = false;
+      let first = null;
+      let startedAt = 0;
+      const finish = (value) => {
+        if (done) return;
+        done = true;
+        window.chrome.webview.removeEventListener('message', onMessage);
+        resolve(value);
+      };
+      const onMessage = (event) => {
+        const next = event && event.data && event.data.state;
+        if (!next || !next.preview || !next.status) return;
+        const sample = {
+          title: String(next.status.title || ''),
+          detail: String(next.status.detail || ''),
+          phase: String(next.status.phaseLabel || ''),
+          progress: Number(next.status.progress || 0),
+        };
+        if (!sawPreview) {
+          sawPreview = true;
+          first = sample;
+          startedAt = Date.now();
+          return;
+        }
+        const changed = sample.phase !== first.phase || sample.progress !== first.progress;
+        if (changed && Date.now() - startedAt >= 900) {
+          finish({ ok: true, sawPreview, first, latest: sample, elapsedMs: Date.now() - startedAt });
+        }
+      };
+      window.chrome.webview.addEventListener('message', onMessage);
+      window.chrome.webview.postMessage({ type: 'command', id: 'smoke-preview-start', command: 'togglePreview' });
+      setTimeout(() => finish({ ok: false, sawPreview, message: 'Animation preview did not advance within 6 seconds.' }), 6000);
+    })`, true);
+    const previewLabelled = Boolean(preview && preview.first && preview.first.title === 'Animation preview'
+      && preview.first.detail.includes('No backup is running'));
+    const previewAdvanced = Boolean(preview && preview.ok && preview.latest
+      && (preview.latest.phase !== preview.first.phase || preview.latest.progress !== preview.first.progress));
+    checks.push({
+      name: 'animation-preview',
+      ok: previewLabelled && previewAdvanced,
+      details: preview,
+    });
+
+    if (preview && preview.ok) {
+      try {
+        // Let the React frame paint the live preview state before capturing it.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        smokePreviewPath = await captureSmokePreview();
+      } catch (error) {
+        checks.push({ name: 'preview-capture', ok: false, details: error instanceof Error ? error.message : String(error) });
+      }
+    }
+    if (smokePreviewPath) {
+      checks.push({ name: 'preview-capture', ok: true, details: path.basename(smokePreviewPath) });
+    }
+
+    let stopped = { ok: false, message: 'Animation preview did not start.' };
+    if (preview && preview.sawPreview) {
+      stopped = await mainWindow.webContents.executeJavaScript(`new Promise((resolve) => {
+        let done = false;
+        let sawPreview = false;
+        const finish = (value) => {
+          if (done) return;
+          done = true;
+          window.chrome.webview.removeEventListener('message', onMessage);
+          resolve(value);
+        };
+        const onMessage = (event) => {
+          const next = event && event.data && event.data.state;
+          if (!next) return;
+          if (next.preview) {
+            sawPreview = true;
+            return;
+          }
+          if (sawPreview) {
+            finish({
+              ok: true,
+              preview: false,
+              title: String(next.status && next.status.title || ''),
+              active: Boolean(next.status && next.status.active),
+              history: Array.isArray(next.history) ? next.history : [],
+            });
+          }
+        };
+        window.chrome.webview.addEventListener('message', onMessage);
+        window.chrome.webview.postMessage({ type: 'command', id: 'smoke-preview-stop', command: 'togglePreview' });
+        setTimeout(() => finish({ ok: false, message: 'Animation preview did not stop within 4 seconds.' }), 4000);
+      })`, true);
+    }
+    const historyRestored = Boolean(stopped && JSON.stringify(stopped.history || []) === JSON.stringify(state.history || []));
+    const normalStateRestored = Boolean(stopped && stopped.ok && stopped.preview === false
+      && !stopped.title.includes('Animation preview') && stopped.active === false && historyRestored);
+    checks.push({ name: 'animation-preview-stop', ok: normalStateRestored, details: { ...stopped, historyRestored } });
     checks.push({ name: 'renderer-errors', ok: smokeDiagnostics.length === 0, details: smokeDiagnostics.slice(0, 10) });
-    const result = { ok: checks.every((check) => check.ok), appId: APP_ID, version: VERSION, platform: process.platform, arch: process.arch, checks };
+    const result = {
+      ok: checks.every((check) => check.ok),
+      appId: APP_ID,
+      version: VERSION,
+      platform: process.platform,
+      arch: process.arch,
+      smokePreview: smokePreviewPath ? path.basename(smokePreviewPath) : null,
+      checks,
+    };
     await writeSmokeResult(result);
     if (!result.ok) throw new Error(`Smoke checks failed: ${checks.filter((check) => !check.ok).map((check) => check.name).join(', ')}`);
     await closeForSmoke(0);
   } catch (error) {
-    const result = { ok: false, appId: APP_ID, version: VERSION, platform: process.platform, arch: process.arch, checks, error: error instanceof Error ? error.message : String(error) };
+    const result = {
+      ok: false,
+      appId: APP_ID,
+      version: VERSION,
+      platform: process.platform,
+      arch: process.arch,
+      smokePreview: smokePreviewPath ? path.basename(smokePreviewPath) : null,
+      checks,
+      error: error instanceof Error ? error.message : String(error),
+    };
     await writeSmokeResult(result);
     await closeForSmoke(1);
   }
+}
+
+async function captureSmokePreview() {
+  if (!smokeOutput || !mainWindow || mainWindow.isDestroyed()) throw new Error('Smoke window is unavailable for capture.');
+  const target = path.join(path.dirname(path.resolve(smokeOutput)), 'smoke-preview.png');
+  const image = await mainWindow.webContents.capturePage();
+  const png = image.toPNG();
+  if (!png || png.length < 64) throw new Error('Electron returned an empty frontend capture.');
+  await fsp.writeFile(target, png, { mode: 0o600 });
+  await fsp.chmod(target, 0o600).catch(() => undefined);
+  return target;
 }
 
 async function writeSmokeResult(result) {
@@ -988,6 +1126,7 @@ async function closeForSmoke(code) {
 async function boot() {
   if (!coreInitialized) {
     const presentation = readPresentation();
+    presentationTheme = presentation.theme;
     setNativeTheme(presentation.theme);
     installIpc();
     configureNavigation();
@@ -1024,7 +1163,9 @@ app.on('before-quit', (event) => {
   });
 });
 nativeTheme.on('updated', () => {
-  if (!mainWindow || mainWindow.isDestroyed() || readPresentation().theme !== 'System') return;
+  const presentation = readPresentation();
+  presentationTheme = presentation.theme;
+  if (!mainWindow || mainWindow.isDestroyed() || presentation.theme !== 'System') return;
   void sendState().catch(() => undefined);
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin' && !isQuitting) app.quit(); });

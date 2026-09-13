@@ -16,8 +16,8 @@
     "prepare-web": "bash desktop/scripts/prepare-web.sh",
     "fetch-restic": "bash desktop/scripts/fetch-restic.sh",
     "smoke-test": "node desktop/scripts/smoke-test.cjs",
-    "smoke-test:packaged": "node desktop/scripts/smoke-test.cjs --app desktop/dist/mac-arm64-unpacked/Rewindle.app",
-    "smoke-test:packaged:x64": "node desktop/scripts/smoke-test.cjs --app desktop/dist/mac-x64-unpacked/Rewindle.app",
+    "smoke-test:packaged": "node desktop/scripts/smoke-test.cjs --app desktop/dist/mac-arm64/Rewindle.app",
+    "smoke-test:packaged:x64": "node desktop/scripts/smoke-test.cjs --app desktop/dist/mac/Rewindle.app",
     "dist:mac": "electron-builder --config desktop/electron-builder.yml --mac dmg zip --publish never",
     "dist:mac:arm64": "bash desktop/scripts/build-mac.sh arm64",
     "dist:mac:x64": "bash desktop/scripts/build-mac.sh x64"
