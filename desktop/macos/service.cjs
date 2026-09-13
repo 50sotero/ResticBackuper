@@ -761,6 +761,7 @@ class MacBackupService extends EventEmitter {
 
   async _validateRestoreDestination(destination) {
     if (!isAbsolutePath(destination)) throw new Error('Restore destination must be a full macOS path.');
+    if (path.resolve(destination) === path.parse(destination).root) throw new Error('Restore destination cannot be the filesystem root.');
     if (this._config?.repository && pathsOverlap(destination, this._config.repository)) throw new Error('Restore destination cannot overlap the Restic repository.');
     for (const source of this._config?.sources || []) {
       if (pathsOverlap(destination, source)) throw new Error('Restore destination cannot overlap a protected folder.');
