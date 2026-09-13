@@ -2,6 +2,9 @@
 
 Backup you can verify.
 
+[Visit the Rewindle website](https://50sotero.github.io/ResticBackuper/) ·
+[Download for Windows and Mac](https://github.com/50sotero/ResticBackuper/releases/tag/v0.2.0-alpha.1)
+
 Rewindle is a desktop backup app for Windows and macOS, powered by Restic. It
 turns a careful repository setup into a guided workflow with an inspectable
 dashboard, encrypted incremental snapshots, and verification that includes a
