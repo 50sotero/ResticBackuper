@@ -51,6 +51,10 @@ $dashboardTaskCreated = $false
 $shortcutCreated = $false
 $registryCreated = $false
 $firstBackupStarted = $false
+$dashboardAssetsManifest = $null
+$webView2RuntimeVersion = $null
+$webView2RuntimeGuid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+$webView2BootstrapperUri = 'https://go.microsoft.com/fwlink/p/?LinkId=2124703'
 
 function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -233,6 +237,128 @@ function Assert-TreeMatchesManifest {
     }
 }
 
+function Assert-DashboardAssetsManifest {
+    param(
+        [string]$Root,
+        [string]$ManifestPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Dashboard assets manifest is missing: $ManifestPath"
+    }
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    if ($manifest.schema_version -ne 1 -or -not ($manifest.PSObject.Properties.Name -contains 'files')) {
+        throw 'Dashboard assets manifest schema is invalid.'
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($manifest.files)) {
+        $relative = ([string]$entry.relative_path).Replace('/', '\')
+        if (
+            [string]::IsNullOrWhiteSpace($relative) -or
+            [IO.Path]::IsPathRooted($relative) -or
+            $relative.Split('\') -contains '..' -or
+            $relative -match '[<>:"|?*]' -or
+            -not $seen.Add($relative)
+        ) {
+            throw "Dashboard assets manifest contains an unsafe or duplicate path: $relative"
+        }
+        if (
+            -not $relative.StartsWith('web\', [StringComparison]::OrdinalIgnoreCase) -and
+            -not $relative.StartsWith('licenses\', [StringComparison]::OrdinalIgnoreCase) -and
+            $relative -notin @(
+                'Microsoft.Web.WebView2.Core.dll',
+                'Microsoft.Web.WebView2.Wpf.dll',
+                'WebView2Loader.dll'
+            )
+        ) {
+            throw "Dashboard assets manifest contains an unexpected path: $relative"
+        }
+        $path = [IO.Path]::GetFullPath((Join-Path $Root $relative))
+        $prefix = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+        if (-not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Dashboard assets manifest path escapes its root: $relative"
+        }
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Dashboard assets manifest member is not a regular file: $relative"
+        }
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        [long]$bytes = 0
+        if (
+            -not [long]::TryParse([string]$entry.bytes, [ref]$bytes) -or
+            $bytes -lt 0 -or
+            $item.Length -ne $bytes -or
+            $hash -ne [string]$entry.sha256
+        ) {
+            throw "Dashboard assets manifest integrity check failed: $relative"
+        }
+    }
+    foreach ($required in @(
+        'web\index.html',
+        'Microsoft.Web.WebView2.Core.dll',
+        'Microsoft.Web.WebView2.Wpf.dll',
+        'WebView2Loader.dll'
+    )) {
+        if (-not $seen.Contains($required)) {
+            throw "Dashboard assets manifest is missing required member: $required"
+        }
+    }
+    return $manifest
+}
+
+function Get-WebView2RuntimeVersion {
+    $keyPaths = @(
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$webView2RuntimeGuid",
+        "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$webView2RuntimeGuid",
+        "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$webView2RuntimeGuid"
+    )
+    foreach ($keyPath in $keyPaths) {
+        if (-not (Test-Path -LiteralPath $keyPath)) {
+            continue
+        }
+        try {
+            $properties = Get-ItemProperty -LiteralPath $keyPath -ErrorAction Stop
+            $version = [string]$properties.pv
+            if ($version -match '^\d+(?:\.\d+){1,3}$') {
+                return $version
+            }
+        }
+        catch {
+        }
+    }
+    return $null
+}
+
+function Ensure-WebView2Runtime {
+    $existing = Get-WebView2RuntimeVersion
+    if ($existing) {
+        return $existing
+    }
+
+    $bootstrapper = Join-Path ([IO.Path]::GetTempPath()) (
+        'Proofhold-WebView2-' + [Guid]::NewGuid().ToString('N') + '.exe'
+    )
+    try {
+        Write-Host 'Microsoft Edge WebView2 Runtime is missing; downloading the Microsoft bootstrapper.' -ForegroundColor Yellow
+        Invoke-WebRequest -UseBasicParsing -Uri $webView2BootstrapperUri -OutFile $bootstrapper
+        Assert-MicrosoftSignedExecutable -Path $bootstrapper
+        $process = Start-Process -FilePath $bootstrapper -ArgumentList @('/silent', '/install') -Wait -PassThru
+        if ($process.ExitCode -ne 0) {
+            throw "WebView2 Runtime bootstrapper failed with exit code $($process.ExitCode)."
+        }
+        $installed = Get-WebView2RuntimeVersion
+        if (-not $installed) {
+            throw 'WebView2 Runtime bootstrapper completed without registering a runtime.'
+        }
+        return $installed
+    }
+    finally {
+        if (Test-Path -LiteralPath $bootstrapper) {
+            Remove-Item -LiteralPath $bootstrapper -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Assert-Payload {
     if (-not (Test-Path -LiteralPath $payloadRoot -PathType Container)) {
         throw "Installer payload is missing: $payloadRoot"
@@ -284,11 +410,21 @@ function Assert-Payload {
     )
     if (-not $SkipDashboard) {
         $required += 'ResticBackuperDashboard.exe'
+        $required += 'dashboard-assets.json'
+        $required += 'web\index.html'
+        $required += 'Microsoft.Web.WebView2.Core.dll'
+        $required += 'Microsoft.Web.WebView2.Wpf.dll'
+        $required += 'WebView2Loader.dll'
     }
     foreach ($relative in $required) {
         if (-not (Test-Path -LiteralPath (Join-Path $payloadRoot $relative) -PathType Leaf)) {
             throw "Installer payload lacks a required component: $relative"
         }
+    }
+    if (-not $SkipDashboard) {
+        $script:dashboardAssetsManifest = Assert-DashboardAssetsManifest `
+            -Root $payloadRoot `
+            -ManifestPath (Join-Path $payloadRoot 'dashboard-assets.json')
     }
     return $manifest
 }
@@ -841,7 +977,7 @@ foreach ($taskName in @($backupTaskName, $dashboardTaskName)) {
 }
 
 Write-Host ''
-Write-Host "ResticBackuper $version installation summary" -ForegroundColor Cyan
+Write-Host "Proofhold $version installation summary" -ForegroundColor Cyan
 Write-Host "  Repository : $repositoryPath"
 Write-Host "  Storage    : $RepositoryStorageMode"
 if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
@@ -865,6 +1001,11 @@ if (-not $Unattended) {
     if ($confirmation -notmatch '^(?i)y(?:es)?$') {
         throw 'Installation cancelled before any product files were created.'
     }
+}
+
+if (-not $SkipDashboard) {
+    $webView2RuntimeVersion = Ensure-WebView2Runtime
+    Write-Host "  WebView2   : $webView2RuntimeVersion" -ForegroundColor DarkGray
 }
 
 try {
@@ -992,16 +1133,16 @@ try {
         $shortcut.Arguments = '--state-dir "{0}"' -f $stateRoot
         $shortcut.WorkingDirectory = $installRoot
         $shortcut.IconLocation = $dashboard + ',0'
-        $shortcut.Description = 'Open the ResticBackuper dashboard'
+        $shortcut.Description = 'Open the Proofhold dashboard'
         $shortcut.Save()
         $shortcutCreated = $true
     }
 
     New-Item -Path $installRegistry | Out-Null
     $registryCreated = $true
-    New-ItemProperty -Path $installRegistry -Name DisplayName -Value 'ResticBackuper' -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $installRegistry -Name DisplayName -Value 'Proofhold' -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $installRegistry -Name DisplayVersion -Value $version -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $installRegistry -Name Publisher -Value '50sotero and ResticBackuper contributors' -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $installRegistry -Name Publisher -Value '50sotero' -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $installRegistry -Name URLInfoAbout -Value 'https://github.com/50sotero/ResticBackuper' -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $installRegistry -Name InstallLocation -Value $installRoot -PropertyType String -Force | Out-Null
     $uninstallCommand = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $windowsPowerShell, (Join-Path $installRoot 'Uninstall-ResticBackuper.ps1')
@@ -1030,7 +1171,7 @@ try {
     }
 
     Write-Host ''
-    Write-Host 'ResticBackuper installed successfully.' -ForegroundColor Green
+    Write-Host 'Proofhold installed successfully.' -ForegroundColor Green
     Write-Host "Recovery key: $recoveryKey" -ForegroundColor Yellow
     Write-Host 'Copy that key off this computer before relying on the backup.' -ForegroundColor Yellow
     if (-not $firstBackupStarted) {
@@ -1045,6 +1186,7 @@ try {
         user_source_count = $sources.Count
         schedule = $Schedule
         use_vss = $useVss
+        webview2_runtime = $webView2RuntimeVersion
         backup_task = $backupTaskName
         dashboard_task = if ($dashboardTaskCreated) { $dashboardTaskName } else { $null }
         first_backup_started = $firstBackupStarted

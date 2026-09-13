@@ -26,7 +26,7 @@ using Forms = System.Windows.Forms;
 
 namespace ResticBackuper.Dashboard
 {
-    public sealed class DashboardWindow : Window
+    public sealed partial class DashboardWindow : Window
     {
         private enum SourceOperationStage
         {
@@ -223,11 +223,13 @@ namespace ResticBackuper.Dashboard
             this.showEvent = showEvent;
             this.previewEnabled = options.Preview;
             this.previewStarted = DateTime.Now;
-            this.reader = new TelemetryReader(options.StateDirectory, true);
+            this.reader = new TelemetryReader(
+                options.StateDirectory,
+                !options.UseIsolatedPresentationStore);
             this.themeResolution = DashboardThemeManager.LoadAndResolve();
             this.themePreference = this.themeResolution.Preference;
 
-            Title = "ResticBackuper Dashboard";
+            Title = "Proofhold";
             Width = 1280;
             Height = 720;
             MinWidth = 900;
@@ -344,6 +346,7 @@ namespace ResticBackuper.Dashboard
 
             Grid.SetColumn(root, 1);
             shellLayout.Children.Add(root);
+            MountWebPresentation(shellLayout, root);
             AutomationProperties.SetName(shellLayout, "Restic Backup dashboard");
             ShowDashboardPage(selectedDashboardPage);
             ApplyResponsiveLayout();
@@ -3263,6 +3266,7 @@ namespace ResticBackuper.Dashboard
             {
                 TelemetrySnapshot snapshot = reader.Load();
                 lastSnapshot = snapshot;
+                webTelemetryError = string.Empty;
                 ApplySnapshot(snapshot);
                 if (previewEnabled)
                 {
@@ -3272,12 +3276,14 @@ namespace ResticBackuper.Dashboard
             }
             catch (Exception error)
             {
+                webTelemetryError = error.Message;
                 heroTitle.Text = "Dashboard data is temporarily unavailable";
                 heroDetail.Text = error.Message;
                 SetBadge("DATA RETRY", Amber, BrushFrom("#3A2F18"));
                 lastUpdated.Text = "Retrying automatically";
             }
             RefreshSources(false);
+            PublishWebPresentationState();
         }
 
         private void RefreshSchedule(bool force)
@@ -5976,7 +5982,7 @@ namespace ResticBackuper.Dashboard
                 trayApplicationIcon = null;
             }
             icon.Icon = trayApplicationIcon ?? Drawing.SystemIcons.Shield;
-            icon.Text = "ResticBackuper Dashboard";
+            icon.Text = "Proofhold";
             icon.Visible = true;
             Forms.ContextMenuStrip menu = new Forms.ContextMenuStrip();
             menu.Items.Add("Open dashboard", null, delegate { Dispatcher.BeginInvoke(new Action(ShowDashboard)); });
@@ -6058,6 +6064,7 @@ namespace ResticBackuper.Dashboard
 
         private void OnClosed(object sender, EventArgs args)
         {
+            DisposeWebPresentation();
             WriteHeartbeat(lastSnapshot, false);
             refreshTimer.Stop();
             StopShimmer();
@@ -6086,6 +6093,10 @@ namespace ResticBackuper.Dashboard
 
         private void WriteHeartbeat(TelemetrySnapshot snapshot, bool running)
         {
+            if (options != null && options.UseIsolatedPresentationStore)
+            {
+                return;
+            }
             DateTime now = DateTime.UtcNow;
             if (running && lastHeartbeatUtc != DateTime.MinValue && now - lastHeartbeatUtc < TimeSpan.FromSeconds(15))
             {

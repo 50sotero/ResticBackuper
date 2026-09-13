@@ -14,6 +14,7 @@ if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitPr
 }
 
 $productName = 'ResticBackuper'
+$productDisplayName = 'Proofhold'
 $backupTaskName = 'ResticBackuper'
 $dashboardTaskName = 'ResticBackuperDashboard'
 $cloudVerificationTaskName = 'ResticBackuperGoogleDriveSync'
@@ -310,7 +311,7 @@ if ($null -ne $cloudTaskCandidate) {
 
 if (-not $Unattended) {
     Write-Host ''
-    Write-Host 'ResticBackuper uninstall' -ForegroundColor Cyan
+    Write-Host "$productDisplayName uninstall" -ForegroundColor Cyan
     Write-Host "  App runtime : $installRoot"
     Write-Host "  Preserved   : $stateRoot"
     if ($configuration) {
@@ -375,7 +376,8 @@ if (Test-Path -LiteralPath $startMenuShortcut -PathType Leaf) {
 
 if (Test-Path -LiteralPath $installRegistry) {
     $registration = Get-ItemProperty -LiteralPath $installRegistry
-    if ($registration.DisplayName -eq $productName -and (Get-NormalizedPath ([string]$registration.InstallLocation)) -eq (Get-NormalizedPath $installRoot)) {
+    if (($registration.DisplayName -eq $productName -or $registration.DisplayName -eq $productDisplayName) -and
+        (Get-NormalizedPath ([string]$registration.InstallLocation)) -eq (Get-NormalizedPath $installRoot)) {
         Remove-Item -LiteralPath $installRegistry -Recurse -Force
     }
     else {
@@ -384,7 +386,7 @@ if (Test-Path -LiteralPath $installRegistry) {
 }
 
 Write-Host ''
-Write-Host 'ResticBackuper app components were removed.' -ForegroundColor Green
+Write-Host "$productDisplayName app components were removed." -ForegroundColor Green
 Write-Host "Preserved backup state: $stateRoot"
 if (Test-Path -LiteralPath $cloudVerificationRoot -PathType Container) {
     Write-Host "Preserved cloud verification assets/evidence: $cloudVerificationRoot"
