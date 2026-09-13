@@ -487,12 +487,13 @@ test('scheduler writes an escaped user LaunchAgent with exact HH:mm and safe arg
   await fs.writeFile(executable, '#!/bin/sh\n', { mode: 0o700 });
   await fs.chmod(executable, 0o700).catch(() => undefined);
   const launcherCalls = [];
+  let launchAgentLoaded = true;
   const fakeSpawn = (executable, args) => {
     launcherCalls.push({ executable, args });
     const child = new EventEmitter();
     child.stdout = new PassThrough();
     child.stderr = new PassThrough();
-    queueMicrotask(() => child.emit('close', 0, null));
+    queueMicrotask(() => child.emit('close', args[0] === 'print' && !launchAgentLoaded ? 1 : 0, null));
     return child;
   };
   const scheduler = new MacLaunchAgentScheduler({
@@ -508,6 +509,13 @@ test('scheduler writes an escaped user LaunchAgent with exact HH:mm and safe arg
   assert.deepEqual(launcherCalls.at(-1).args, ['bootstrap', 'gui/501', result.path]);
   const installed = await scheduler.readDailyLaunchAgent();
   assert.deepEqual(installed.time, '23:45');
+  assert.equal(installed.loaded, true);
+  assert.equal(installed.verified, true);
+  launchAgentLoaded = false;
+  const notLoaded = await scheduler.readDailyLaunchAgent();
+  assert.equal(notLoaded.loaded, false);
+  assert.equal(notLoaded.enabled, false);
+  assert.equal(notLoaded.verified, false);
   await scheduler.removeDailyLaunchAgent();
   assert.deepEqual(launcherCalls.at(-1).args, ['bootout', 'gui/501/com.rewindle.backup']);
   await assert.rejects(() => fs.access(result.path));
