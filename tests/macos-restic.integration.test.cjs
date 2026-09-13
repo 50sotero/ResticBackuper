@@ -7,19 +7,19 @@ const path = require('node:path');
 const os = require('node:os');
 const { MacBackupService } = require('../desktop/macos/service.cjs');
 
-const resticPath = process.env.PROOFHOLD_RESTIC_PATH || process.env.RESTIC_BINARY || '';
-const runReal = process.env.PROOFHOLD_REAL_RESTIC === '1' && process.platform === 'darwin' && Boolean(resticPath);
+const resticPath = process.env.REWINDLE_RESTIC_PATH || process.env.RESTIC_BINARY || '';
+const runReal = process.env.REWINDLE_REAL_RESTIC === '1' && process.platform === 'darwin' && Boolean(resticPath);
 
 test('real Restic can initialize, back up, verify a canary, and restore into an independent empty folder', {
-  skip: !runReal ? 'Set PROOFHOLD_REAL_RESTIC=1 and PROOFHOLD_RESTIC_PATH on macOS to run the integration check.' : false,
+  skip: !runReal ? 'Set REWINDLE_REAL_RESTIC=1 and REWINDLE_RESTIC_PATH on macOS to run the integration check.' : false,
 }, async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'proofhold-restic-integration-'));
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'rewindle-restic-integration-'));
   const source = path.join(root, 'source');
   const repository = path.join(root, 'repository');
   const dataDir = path.join(root, 'state');
   const destination = path.join(root, 'independent-restore');
   await fs.mkdir(source, { recursive: true });
-  await fs.writeFile(path.join(source, 'fixture.txt'), 'Proofhold real Restic integration\n');
+  await fs.writeFile(path.join(source, 'fixture.txt'), 'Rewindle real Restic integration\n');
   const recoveryKey = path.join(root, 'recovery-key.txt');
   const ui = {
     chooseDirectories: async (options) => options.multiple ? [source] : repository,
@@ -64,5 +64,5 @@ test('real Restic can initialize, back up, verify a canary, and restore into an 
   }
   const restoredFile = await findFixture(destination);
   assert.ok(restoredFile);
-  assert.equal(await fs.readFile(restoredFile, 'utf8'), 'Proofhold real Restic integration\n');
+  assert.equal(await fs.readFile(restoredFile, 'utf8'), 'Rewindle real Restic integration\n');
 });
