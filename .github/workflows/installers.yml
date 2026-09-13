@@ -87,6 +87,15 @@ jobs:
       - name: Verify real backup and independent restore
         shell: pwsh
         run: .\tests\Test-ReleaseArtifact.ps1
+      - name: Package the editable brand kit
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -Raw).Trim()
+          $name = "Rewindle-v$version-brand-kit.zip"
+          git archive --format=zip --output="artifacts/$name" HEAD brand
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash -LiteralPath "artifacts/$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText((Join-Path $PWD "artifacts/$name.sha256"), "$hash *$name`n")
       - name: Upload Windows installers
         uses: actions/upload-artifact@v7
         with:
