@@ -14,7 +14,7 @@ if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitPr
 }
 
 $productName = 'ResticBackuper'
-$productDisplayName = 'Proofhold'
+$productDisplayName = 'Rewindle'
 $backupTaskName = 'ResticBackuper'
 $dashboardTaskName = 'ResticBackuperDashboard'
 $cloudVerificationTaskName = 'ResticBackuperGoogleDriveSync'

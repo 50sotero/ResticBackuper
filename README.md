@@ -1,28 +1,29 @@
-# Proofhold
+# Rewindle
 
 Backup you can verify.
 
-Proofhold is a desktop backup app for Windows and macOS, powered by Restic. It
+Rewindle is a desktop backup app for Windows and macOS, powered by Restic. It
 turns a careful repository setup into a guided workflow with an inspectable
 dashboard, encrypted incremental snapshots, and verification that includes a
 real canary restore. The same animated dashboard is shared by both desktop
 shells and uses the literal Beautiful UI components and motion primitives
 recorded in [`src/dashboard/web/vendor/UPSTREAM.md`](src/dashboard/web/vendor/UPSTREAM.md).
 
-The public product name is Proofhold. Existing Windows task names, executable
+The public product name is Rewindle. Existing Windows task names, executable
 names, install paths, and recovery files retain their `ResticBackuper` names so
 existing protected state and operational tooling remain compatible.
 
 > [!WARNING]
-> **v0.2.0-alpha.1 is an early public test release.** The Windows and macOS
-> installers are not signed or notarized, and the project has not yet been
+> **v0.2.0-alpha.1 is an early public test release.** Windows executables are
+> unsigned. The Mac app uses an ad-hoc signature without Developer ID signing
+> or Apple notarization, and the project has not yet been
 > validated across a broad range of machines. Test it with non-critical data
 > and an independent restore target before relying on it. Keep another backup
 > while you evaluate it.
 
 ## How it works
 
-Proofhold grew out of a real nightly backup routine. Select the folders and
+Rewindle grew out of a real nightly backup routine. Select the folders and
 repository explicitly, then use the dashboard to see the last verified run,
 repository checks, canary evidence, and restore history. The app does not
 silently choose a cloud destination or claim that a local repository is an
@@ -138,7 +139,7 @@ restore tests appropriate to your own threat model.
 - Preserves the repository, recovery material, and run history when the app is
   uninstalled.
 
-Proofhold does not automatically prune snapshots or delete repository data.
+Rewindle does not automatically prune snapshots or delete repository data.
 The repository will therefore grow until you deliberately introduce and test a
 retention policy.
 
@@ -190,10 +191,10 @@ Restic installation is not required for either packaged app.
 2. Verify the download before extracting it:
 
    ```powershell
-   Get-FileHash .\Proofhold-v0.2.0-alpha.1-windows-x64.zip -Algorithm SHA256
-   Get-Content .\Proofhold-v0.2.0-alpha.1-windows-x64.zip.sha256
-   Get-FileHash .\Proofhold-v0.2.0-alpha.1-windows-x64-setup.exe -Algorithm SHA256
-   Get-Content .\Proofhold-v0.2.0-alpha.1-windows-x64-setup.exe.sha256
+   Get-FileHash .\Rewindle-v0.2.0-alpha.1-windows-x64.zip -Algorithm SHA256
+   Get-Content .\Rewindle-v0.2.0-alpha.1-windows-x64.zip.sha256
+   Get-FileHash .\Rewindle-v0.2.0-alpha.1-windows-x64-setup.exe -Algorithm SHA256
+   Get-Content .\Rewindle-v0.2.0-alpha.1-windows-x64-setup.exe.sha256
    ```
 
    Each computed value must match the corresponding published checksum.
@@ -226,13 +227,13 @@ changed.
 Download the arm64 build for Apple Silicon or the x64 build for an Intel Mac:
 
 ```text
-Proofhold-0.2.0-alpha.1-arm64.dmg
-Proofhold-0.2.0-alpha.1-arm64.zip
-Proofhold-0.2.0-alpha.1-x64.dmg
-Proofhold-0.2.0-alpha.1-x64.zip
+Rewindle-0.2.0-alpha.1-arm64.dmg
+Rewindle-0.2.0-alpha.1-arm64.zip
+Rewindle-0.2.0-alpha.1-x64.dmg
+Rewindle-0.2.0-alpha.1-x64.zip
 ```
 
-Open the DMG and move Proofhold to Applications, or extract the ZIP. macOS may
+Open the DMG and move Rewindle to Applications, or extract the ZIP. macOS may
 ask for privacy access to selected source folders. The first setup selects a
 local repository and source folders, generates an encrypted repository
 password through the macOS keychain-backed safe-storage facility, and offers a
@@ -469,7 +470,7 @@ logs, repositories, DPAPI envelopes, or recovery keys.
 
 ## License
 
-Proofhold is available under the [MIT License](LICENSE). Release bundles also
+Rewindle is available under the [MIT License](LICENSE). Release bundles also
 contain Restic under the BSD 2-Clause License, Python under the Python Software
 Foundation License and its accompanying notices, and the web and Electron
 runtime notices described in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

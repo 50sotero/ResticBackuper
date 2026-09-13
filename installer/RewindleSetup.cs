@@ -6,17 +6,25 @@ using System.IO.Compression;
 using System.Reflection;
 using System.Windows.Forms;
 
-namespace Proofhold.Setup
+[assembly: AssemblyTitle("Rewindle Setup")]
+[assembly: AssemblyDescription("Install Rewindle encrypted backup and verified recovery")]
+[assembly: AssemblyProduct("Rewindle")]
+[assembly: AssemblyCompany("Rewindle contributors")]
+[assembly: AssemblyVersion("0.2.0.1")]
+[assembly: AssemblyFileVersion("0.2.0.1")]
+[assembly: AssemblyInformationalVersion("0.2.0-alpha.1")]
+
+namespace Rewindle.Setup
 {
     internal static class Program
     {
-        private const string BundleResourceName = "PROOFHOLD_BUNDLE";
+        private const string BundleResourceName = "REWINDLE_BUNDLE";
 
         private static int Main()
         {
             string extractionRoot = Path.Combine(
                 Path.GetTempPath(),
-                "Proofhold-Setup-" + Guid.NewGuid().ToString("N"));
+                "Rewindle-Setup-" + Guid.NewGuid().ToString("N"));
             try
             {
                 Directory.CreateDirectory(extractionRoot);
@@ -24,7 +32,7 @@ namespace Proofhold.Setup
                 string installer = Path.Combine(extractionRoot, "Install.cmd");
                 if (!File.Exists(installer))
                 {
-                    throw new InvalidDataException("The embedded Proofhold installer is incomplete.");
+                    throw new InvalidDataException("The embedded Rewindle installer is incomplete.");
                 }
 
                 ProcessStartInfo startInfo = new ProcessStartInfo
@@ -42,8 +50,8 @@ namespace Proofhold.Setup
             catch (Exception error)
             {
                 MessageBox.Show(
-                    "Proofhold setup could not start.\n\n" + error.Message,
-                    "Proofhold setup",
+                    "Rewindle setup could not start.\n\n" + error.Message,
+                    "Rewindle setup",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
                 return 1;
@@ -71,7 +79,7 @@ namespace Proofhold.Setup
             {
                 if (resource == null)
                 {
-                    throw new InvalidDataException("The embedded Proofhold payload is missing.");
+                    throw new InvalidDataException("The embedded Rewindle payload is missing.");
                 }
                 using (ZipArchive archive = new ZipArchive(resource, ZipArchiveMode.Read, false))
                 {
@@ -90,14 +98,14 @@ namespace Proofhold.Setup
                             !seen.Add(relative))
                         {
                             throw new InvalidDataException(
-                                "The embedded Proofhold payload contains an unsafe path.");
+                                "The embedded Rewindle payload contains an unsafe path.");
                         }
 
                         string path = Path.GetFullPath(Path.Combine(destinationRoot, relative));
                         if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase))
                         {
                             throw new InvalidDataException(
-                                "The embedded Proofhold payload escapes its temporary directory.");
+                                "The embedded Rewindle payload escapes its temporary directory.");
                         }
                         if (entry.FullName.EndsWith("/", StringComparison.Ordinal))
                         {

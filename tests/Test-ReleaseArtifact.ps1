@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..')).TrimEnd('\')
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw).Trim()
 if (-not $Artifact) {
-    $Artifact = Join-Path $projectRoot "artifacts\Proofhold-v$version-windows-x64.zip"
+    $Artifact = Join-Path $projectRoot "artifacts\Rewindle-v$version-windows-x64.zip"
 }
 $artifactPath = [IO.Path]::GetFullPath($Artifact)
 if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {

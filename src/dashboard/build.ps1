@@ -49,11 +49,11 @@ if (-not $SkipWeb) {
     try {
         & npm.cmd ci --no-audit --no-fund
         if ($LASTEXITCODE -ne 0) {
-            throw 'Proofhold web dependencies could not be installed.'
+            throw 'Rewindle web dependencies could not be installed.'
         }
         & npm.cmd run build
         if ($LASTEXITCODE -ne 0) {
-            throw 'Proofhold web build failed.'
+            throw 'Rewindle web build failed.'
         }
     }
     finally {
@@ -61,7 +61,7 @@ if (-not $SkipWeb) {
     }
 }
 if (-not (Test-Path -LiteralPath (Join-Path $webOutput 'index.html') -PathType Leaf)) {
-    throw "Built Proofhold web assets are unavailable: $webOutput"
+    throw "Built Rewindle web assets are unavailable: $webOutput"
 }
 
 $references = @(
@@ -151,6 +151,8 @@ if (Test-Path -LiteralPath $licenseDirectory) {
     Remove-Item -LiteralPath $licenseDirectory -Recurse -Force
 }
 New-Item -ItemType Directory -Path $licenseDirectory -Force | Out-Null
+& node (Join-Path $webRoot 'scripts\collect-licenses.mjs')
+if ($LASTEXITCODE -ne 0) { throw 'Could not collect frontend dependency licenses.' }
 $beautifulUiLicense = Join-Path $webRoot 'vendor\BEAUTIFULUI-MIT-LICENSE.txt'
 if (Test-Path -LiteralPath $beautifulUiLicense -PathType Leaf) {
     Copy-Item -LiteralPath $beautifulUiLicense -Destination $licenseDirectory -Force

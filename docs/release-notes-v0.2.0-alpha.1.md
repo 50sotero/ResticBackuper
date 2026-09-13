@@ -1,6 +1,6 @@
-# Proofhold v0.2.0-alpha.1
+# Rewindle v0.2.0-alpha.1
 
-Proofhold is the new desktop identity for the ResticBackuper backup runtime:
+Rewindle is the new desktop identity for the ResticBackuper backup runtime:
 
 > **Backup you can verify.**
 
@@ -19,11 +19,11 @@ their `ResticBackuper` names so the operational contracts remain stable.
   expandable rows, loading animations, and the activity trend animate from real
   state. Reduced-motion preferences are respected, and the UI contains no
   default remote demo video or fabricated backup data.
-- The Proofhold brand is applied to the shared desktop presentation while the
+- The Rewindle brand is applied to the shared desktop presentation while the
   Windows runtime keeps its `ResticBackuper` compatibility names.
 - Windows release output now includes:
-  `Proofhold-v0.2.0-alpha.1-windows-x64.zip`, the matching
-  `Proofhold-v0.2.0-alpha.1-windows-x64-setup.exe`, and SHA-256 checksum files.
+  `Rewindle-v0.2.0-alpha.1-windows-x64.zip`, the matching
+  `Rewindle-v0.2.0-alpha.1-windows-x64-setup.exe`, and SHA-256 checksum files.
   The setup executable embeds the same ZIP and launches the existing reviewed
   PowerShell installer. It is not a second installer implementation.
 - The Windows setup flow checks for WebView2 and obtains Microsoft's signed
@@ -52,7 +52,7 @@ cloud proof, repository migration, or the advanced Windows repair workflows.
 Its schedule is a per-user launchd job and requires a logged-in user session.
 
 Both platforms require an independent restore test before the installation is
-trusted with irreplaceable data. Proofhold does not automatically prune or
+trusted with irreplaceable data. Rewindle does not automatically prune or
 delete repository snapshots.
 
 ## Download and verify
@@ -66,10 +66,10 @@ For macOS, choose the arm64 DMG or ZIP on Apple Silicon and the x64 DMG or ZIP
 on an Intel Mac:
 
 ```text
-Proofhold-0.2.0-alpha.1-arm64.dmg
-Proofhold-0.2.0-alpha.1-arm64.zip
-Proofhold-0.2.0-alpha.1-x64.dmg
-Proofhold-0.2.0-alpha.1-x64.zip
+Rewindle-0.2.0-alpha.1-arm64.dmg
+Rewindle-0.2.0-alpha.1-arm64.zip
+Rewindle-0.2.0-alpha.1-x64.dmg
+Rewindle-0.2.0-alpha.1-x64.zip
 ```
 
 ## Signing status

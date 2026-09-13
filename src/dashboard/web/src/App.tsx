@@ -291,14 +291,14 @@ export default function App() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [page, send]);
-  if (!state) return <div className="connection-screen"><ShieldCheck size={32} className="text-ink-3" /><LoadingState label="Connecting to Restic" variant="Orbit" /><p>{window.chrome?.webview ? 'Loading your protected folders, backup history, and repository status.' : 'Open the desktop app to connect to your backup state.'}</p></div>;
+  if (!state) return <div className="connection-screen"><img src="./rewindle-icon.svg" alt="" width="48" height="48" /><LoadingState label="Opening Rewindle" variant="Orbit" /><p>{window.chrome?.webview ? 'Loading your protected folders, backup history, and repository status.' : 'Open the desktop app to connect to your backup state.'}</p></div>;
   const recents = [...state.history].sort((a, b) => Date.parse(b.started) - Date.parse(a.started)).slice(0, 8).map(run => ({ id: run.id, label: `${run.startedDisplay} · ${run.result}` }));
   return <MotionConfig reducedMotion={state.reducedMotion ? 'always' : 'user'}><div className="app-shell">
     <a className="skip-link" href="#main-content" onClick={event => { event.preventDefault(); pageRef.current?.focus(); }}>Skip to content</a>
     <SidebarNav className="app-sidebar" fill activeNav={page} onNavigate={key => navigate(key as DashboardPage)} navItems={navItems}
       primaryActionLabel={state.actions.backupNow?.label || 'Back up now'} primaryActionIcon={<Play size={16} />}
       primaryActionDisabled={!state.actions.backupNow?.enabled} primaryActionHelp={state.actions.backupNow?.help} onPrimaryAction={() => send('backupNow')}
-      workspace={{ key: 'restic', name: 'restic', monogram: 'r' }} onWorkspaceSettings={() => navigate('Settings')} recents={recents} recentLabel="Recent backups" recentSearchLabel="Search recent backups"
+      workspace={{ key: 'rewindle', name: 'rewindle', monogram: 'r', logo: <img className="brand-icon" src="./rewindle-icon.svg" alt="" /> }} onWorkspaceSettings={() => navigate('Settings')} recents={recents} recentLabel="Recent backups" recentSearchLabel="Search recent backups"
       activeTitle={recents.find(run => run.id === state.selectedRunId)?.label ?? null}
       onPick={id => { setHistoryView({ query: '', sort: 'newest', filter: 'all' }); scrollPositions.current.Activity = 0; send('selectRun', { runId: id }); navigate('Activity'); }} footerLabel="Settings" footerActive={page === 'Settings'} footerIcon={<Settings size={14} />} onFooterClick={() => navigate('Settings')} />
     <div className="workspace"><header className="topbar"><div className="breadcrumb"><span>Personal workspace</span><ChevronRight size={11} /><strong>{page}</strong></div><div className="toolbar-actions">

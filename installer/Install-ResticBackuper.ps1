@@ -336,7 +336,7 @@ function Ensure-WebView2Runtime {
     }
 
     $bootstrapper = Join-Path ([IO.Path]::GetTempPath()) (
-        'Proofhold-WebView2-' + [Guid]::NewGuid().ToString('N') + '.exe'
+        'Rewindle-WebView2-' + [Guid]::NewGuid().ToString('N') + '.exe'
     )
     try {
         Write-Host 'Microsoft Edge WebView2 Runtime is missing; downloading the Microsoft bootstrapper.' -ForegroundColor Yellow
@@ -977,7 +977,7 @@ foreach ($taskName in @($backupTaskName, $dashboardTaskName)) {
 }
 
 Write-Host ''
-Write-Host "Proofhold $version installation summary" -ForegroundColor Cyan
+Write-Host "Rewindle $version installation summary" -ForegroundColor Cyan
 Write-Host "  Repository : $repositoryPath"
 Write-Host "  Storage    : $RepositoryStorageMode"
 if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
@@ -1133,14 +1133,14 @@ try {
         $shortcut.Arguments = '--state-dir "{0}"' -f $stateRoot
         $shortcut.WorkingDirectory = $installRoot
         $shortcut.IconLocation = $dashboard + ',0'
-        $shortcut.Description = 'Open the Proofhold dashboard'
+        $shortcut.Description = 'Open the Rewindle dashboard'
         $shortcut.Save()
         $shortcutCreated = $true
     }
 
     New-Item -Path $installRegistry | Out-Null
     $registryCreated = $true
-    New-ItemProperty -Path $installRegistry -Name DisplayName -Value 'Proofhold' -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $installRegistry -Name DisplayName -Value 'Rewindle' -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $installRegistry -Name DisplayVersion -Value $version -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $installRegistry -Name Publisher -Value '50sotero' -PropertyType String -Force | Out-Null
     New-ItemProperty -Path $installRegistry -Name URLInfoAbout -Value 'https://github.com/50sotero/ResticBackuper' -PropertyType String -Force | Out-Null
@@ -1171,7 +1171,7 @@ try {
     }
 
     Write-Host ''
-    Write-Host 'Proofhold installed successfully.' -ForegroundColor Green
+    Write-Host 'Rewindle installed successfully.' -ForegroundColor Green
     Write-Host "Recovery key: $recoveryKey" -ForegroundColor Yellow
     Write-Host 'Copy that key off this computer before relying on the backup.' -ForegroundColor Yellow
     if (-not $firstBackupStarted) {

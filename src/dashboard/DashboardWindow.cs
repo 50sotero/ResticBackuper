@@ -228,13 +228,13 @@ namespace ResticBackuper.Dashboard
                 !options.UseIsolatedPresentationStore);
             if (options.UseIsolatedPresentationStore)
             {
-                DashboardThemeManager.IsolatedSettingsRoot = Path.Combine(
-                    Path.GetTempPath(), "ResticBackuperPresentationSettings");
+                DashboardThemeManager.IsolatedSettingsRoot = System.IO.Path.Combine(
+                    System.IO.Path.GetTempPath(), "ResticBackuperPresentationSettings");
             }
             this.themeResolution = DashboardThemeManager.LoadAndResolve();
             this.themePreference = this.themeResolution.Preference;
 
-            Title = "Proofhold";
+            Title = "Rewindle";
             Width = 1280;
             Height = 720;
             MinWidth = 900;
@@ -1147,7 +1147,7 @@ namespace ResticBackuper.Dashboard
             StackPanel titlePanel = new StackPanel();
             headerTitlePanel = titlePanel;
             TextBlock title = new TextBlock();
-            title.Text = "Restic Backup";
+            title.Text = "Rewindle";
             title.FontSize = 21;
             title.FontWeight = FontWeights.SemiBold;
             title.Foreground = PrimaryText;
@@ -2644,7 +2644,7 @@ namespace ResticBackuper.Dashboard
             }
 
             SaveFileDialog dialog = new SaveFileDialog();
-            dialog.Title = "Export redacted Restic Backup diagnostics";
+            dialog.Title = "Export redacted Rewindle diagnostics";
             dialog.Filter = "ZIP archive (*.zip)|*.zip";
             dialog.DefaultExt = ".zip";
             dialog.AddExtension = true;
@@ -5987,7 +5987,7 @@ namespace ResticBackuper.Dashboard
                 trayApplicationIcon = null;
             }
             icon.Icon = trayApplicationIcon ?? Drawing.SystemIcons.Shield;
-            icon.Text = "Proofhold";
+            icon.Text = "Rewindle";
             icon.Visible = true;
             Forms.ContextMenuStrip menu = new Forms.ContextMenuStrip();
             menu.Items.Add("Open dashboard", null, delegate { Dispatcher.BeginInvoke(new Action(ShowDashboard)); });

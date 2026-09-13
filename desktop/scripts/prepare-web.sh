@@ -10,6 +10,7 @@ if [[ -f "${WEB_DIR}/package.json" ]]; then
   command -v npm >/dev/null 2>&1 || { printf 'prepare-web: npm is required to build the shared React client\n' >&2; exit 1; }
   npm --prefix "$WEB_DIR" ci
   npm --prefix "$WEB_DIR" run build
+  node "$WEB_DIR/scripts/collect-licenses.mjs"
 fi
 
 if [[ ! -f "$WEB_INDEX" ]]; then

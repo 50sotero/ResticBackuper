@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes Proofhold v0.2.0-alpha.1 for Windows x64 and macOS
+This document describes Rewindle v0.2.0-alpha.1 for Windows x64 and macOS
 arm64/x64. The product uses one shared React dashboard inside two native
 desktop shells. The Windows implementation retains the `ResticBackuper`
 executable, task, and protected-state identifiers for compatibility. Restic
@@ -120,7 +120,7 @@ restores of representative user data remain essential.
 
 The following table describes the Windows protected runtime. The executable
 and task names are intentionally still `ResticBackuper` inside the branded
-Proofhold release.
+Rewindle release.
 
 | Component | Responsibility | Write scope |
 | --- | --- | --- |
@@ -243,7 +243,7 @@ stale. Legacy local-mirror status is explicitly rejected.
 ## Installer and supply chain
 
 The public Windows alpha is distributed as both a transparent ZIP and a
-Proofhold setup executable. The setup executable embeds the same ZIP and
+Rewindle setup executable. The setup executable embeds the same ZIP and
 launches the existing reviewed PowerShell installer; it does not introduce a
 second installer implementation. Both paths embed pinned Windows x64 releases
 of Python 3.14.6 and Restic 0.19.1, so installation does not execute an

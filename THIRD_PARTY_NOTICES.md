@@ -1,6 +1,6 @@
 # Third-party notices
 
-Proofhold is an independent community project and is not affiliated with or
+Rewindle is an independent community project and is not affiliated with or
 endorsed by the Restic project, the Python Software Foundation, Beautiful UI,
 Motion, or any other upstream project listed here.
 
@@ -41,7 +41,7 @@ that source or runtime:
   package and the generated brand assets.
 
 The web UI preserves the upstream component structure and keyframes while
-connecting the components to Proofhold state. Decorative motion does not
+connecting the components to Rewindle state. Decorative motion does not
 provide backup evidence and is disabled or reduced when the operating system
 requests reduced motion.
 

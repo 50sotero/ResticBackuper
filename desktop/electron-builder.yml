@@ -17,13 +17,8 @@ extraResources:
     to: restic/restic
   - from: desktop/vendor/restic/restic.sha256
     to: restic/restic.sha256
-  - from: src
-    to: core-src
-    filter:
-      - '**/*.py'
-      - '**/*.json'
-      - '**/*.txt'
-      - '**/*.ps1'
+  - from: src/dashboard/dist/licenses
+    to: licenses/frontend
   - from: licenses
     to: licenses
   - from: THIRD_PARTY_NOTICES.md

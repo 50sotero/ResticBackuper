@@ -1,6 +1,6 @@
 @echo off
 setlocal
-title Proofhold Installer
+title Rewindle Installer
 set "RESTICBACKUPER_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%RESTICBACKUPER_POWERSHELL%" (
   echo Required 64-bit Windows PowerShell was not found.

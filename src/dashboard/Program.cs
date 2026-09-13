@@ -62,7 +62,7 @@ namespace ResticBackuper.Dashboard
                     "This dashboard intentionally runs without administrator privileges. " +
                     "Protected folder changes and manual backup requests ask for Windows approval when needed. " +
                     "Please launch it normally instead of using Run as administrator.",
-                    "Proofhold",
+                    "Rewindle",
                     MessageBoxButton.OK,
                     MessageBoxImage.Information);
                 return 3;
@@ -112,7 +112,7 @@ namespace ResticBackuper.Dashboard
         {
             MessageBox.Show(
                 "The backup dashboard hit an unexpected display error.\n\n" + args.Exception.Message,
-                "Proofhold",
+                "Rewindle",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             args.Handled = true;

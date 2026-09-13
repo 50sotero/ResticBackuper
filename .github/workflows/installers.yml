@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    branches: ["codex/rewindle-installers"]
 
 permissions:
   contents: read
@@ -36,9 +37,9 @@ jobs:
         run: npm run fetch-restic -- --arch ${{ matrix.arch }}
       - name: Verify backup service and real Restic recovery
         env:
-          PROOFHOLD_REAL_RESTIC: "1"
+          REWINDLE_REAL_RESTIC: "1"
         run: |
-          export PROOFHOLD_RESTIC_PATH="$PWD/desktop/vendor/restic/${{ matrix.arch }}/restic"
+          export REWINDLE_RESTIC_PATH="$PWD/desktop/vendor/restic/${{ matrix.arch }}/restic"
           node --test tests/macos-service.test.cjs tests/macos-restic.integration.test.cjs
       - name: Build disk image and application archive
         env:
@@ -49,6 +50,7 @@ jobs:
           PACKAGED_APP="$(find desktop/dist -maxdepth 3 -name '*.app' -print -quit)"
           test -n "$PACKAGED_APP"
           npm run smoke-test -- --app "$PACKAGED_APP" --output desktop/dist/smoke-test.json
+          codesign --verify --deep --strict --verbose=2 "$PACKAGED_APP"
       - name: Verify packaged app and write checksums
         run: |
           test -n "$(find desktop/dist -maxdepth 1 -name '*.dmg' -print -quit)"

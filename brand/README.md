@@ -1,4 +1,8 @@
-# Brand assets
+# Rewindle brand assets
+
+**Rewindle — Backup you can verify.**
+
+The rewind loop represents returning to a saved point in time. The check represents completed verification. The supporting line, “Keep creating. Come back anytime.”, is suitable for introductory artwork; operational screens always describe the actual backup and recovery evidence.
 
 The editable SVG files are the source artwork. App icons are supplied as PNG, ICO, and ICNS for the desktop installers. The wordmarks use outlined Inter glyphs so they render consistently without a font installation.
 

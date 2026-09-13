@@ -322,7 +322,7 @@ $manifest = New-PayloadManifest
 $dashboardExecutablePath = Join-Path $payloadRoot 'ResticBackuperDashboard.exe'
 $dashboardExecutableSha256 = (Get-FileHash -LiteralPath $dashboardExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant()
 $dashboardAssetsManifestSha256 = (Get-FileHash -LiteralPath (Join-Path $payloadRoot 'dashboard-assets.json') -Algorithm SHA256).Hash.ToLowerInvariant()
-$bundleId = 'Proofhold/{0}/{1}/{2}' -f $version, $dashboardExecutableSha256, $dashboardAssetsManifestSha256
+$bundleId = 'Rewindle/{0}/{1}/{2}' -f $version, $dashboardExecutableSha256, $dashboardAssetsManifestSha256
 
 $buildInfo = [ordered]@{
     schema_version = 1
@@ -350,7 +350,7 @@ $buildInfo = [ordered]@{
 Write-Utf8NoBom -Path (Join-Path $bundleRoot 'BUILD-INFO.json') -Text ($buildInfo | ConvertTo-Json -Depth 6)
 
 New-Item -ItemType Directory -Path $artifactsRoot -Force | Out-Null
-$artifactName = "Proofhold-v$version-windows-x64.zip"
+$artifactName = "Rewindle-v$version-windows-x64.zip"
 $artifactPath = Assert-PathWithinProject (Join-Path $artifactsRoot $artifactName)
 New-DeterministicZip -SourceDirectory $bundleRoot -Destination $artifactPath
 $artifactHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -360,9 +360,9 @@ Write-Utf8NoBom -Path $checksumPath -Text ("$artifactHash *$artifactName`n")
 if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
     throw "The .NET Framework 4.8 C# compiler is unavailable: $compiler"
 }
-$setupArtifactName = "Proofhold-v$version-windows-x64-setup.exe"
+$setupArtifactName = "Rewindle-v$version-windows-x64-setup.exe"
 $setupArtifactPath = Assert-PathWithinProject (Join-Path $artifactsRoot $setupArtifactName)
-$setupSource = Join-Path $projectRoot 'installer\ProofholdSetup.cs'
+$setupSource = Join-Path $projectRoot 'installer\RewindleSetup.cs'
 $setupIcon = Join-Path $projectRoot 'src\dashboard\assets\dashboard-icon.ico'
 $setupArguments = @(
     '/nologo',
@@ -374,7 +374,7 @@ $setupArguments = @(
     ('/reference:' + (Join-Path $framework 'System.IO.Compression.dll')),
     ('/reference:' + (Join-Path $framework 'System.IO.Compression.FileSystem.dll')),
     ('/reference:' + (Join-Path $framework 'System.Windows.Forms.dll')),
-    ('/resource:' + $artifactPath + ',PROOFHOLD_BUNDLE')
+    ('/resource:' + $artifactPath + ',REWINDLE_BUNDLE')
 )
 if (Test-Path -LiteralPath $setupIcon -PathType Leaf) {
     $setupArguments += '/win32icon:' + $setupIcon
@@ -382,7 +382,7 @@ if (Test-Path -LiteralPath $setupIcon -PathType Leaf) {
 $setupArguments += $setupSource
 & $compiler @setupArguments
 if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupArtifactPath -PathType Leaf)) {
-    throw "Proofhold setup compilation failed with exit code $LASTEXITCODE."
+    throw "Rewindle setup compilation failed with exit code $LASTEXITCODE."
 }
 $setupHash = (Get-FileHash -LiteralPath $setupArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $setupChecksumPath = $setupArtifactPath + '.sha256'
