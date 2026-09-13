@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rewindle</title>
+    <link rel="stylesheet" href="./modal.css" />
+  </head>
+  <body>
+    <main class="dialog" aria-live="polite">
+      <div class="brand-mark" aria-hidden="true">p</div>
+      <div class="eyebrow">Rewindle</div>
+      <h1 id="title">Continue</h1>
+      <p id="message" class="message"></p>
+      <form id="form" novalidate>
+        <div id="fields" class="fields"></div>
+        <div class="actions">
+          <button id="cancel" type="button" class="secondary">Cancel</button>
+          <button id="submit" type="submit" class="primary">Continue</button>
+        </div>
+      </form>
+    </main>
+    <script src="./modal.js"></script>
+  </body>
+</html>

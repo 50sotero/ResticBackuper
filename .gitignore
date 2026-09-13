@@ -20,6 +20,8 @@ heartbeat.json
 .cache/
 artifacts/
 tools/
+node_modules/
+desktop/vendor/
 **/dist/
 **/build-output/
 **/node_modules/

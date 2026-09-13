@@ -1,0 +1,61 @@
+appId: com.rewindle.desktop
+productName: Rewindle
+copyright: Copyright © 2026 Rewindle contributors
+directories:
+  output: desktop/dist
+  buildResources: brand
+files:
+  - desktop/**/*
+  - package.json
+  - '!desktop/vendor/restic/**/*'
+  - '!desktop/dist/**/*'
+asar: true
+extraResources:
+  - from: src/dashboard/dist/web
+    to: web
+  - from: desktop/vendor/restic/restic
+    to: restic/restic
+  - from: desktop/vendor/restic/restic.sha256
+    to: restic/restic.sha256
+  - from: src
+    to: core-src
+    filter:
+      - '**/*.py'
+      - '**/*.json'
+      - '**/*.txt'
+      - '**/*.ps1'
+  - from: licenses
+    to: licenses
+  - from: THIRD_PARTY_NOTICES.md
+    to: THIRD_PARTY_NOTICES.md
+  - from: brand/app-icon.png
+    to: brand/app-icon.png
+mac:
+  category: public.app-category.utilities
+  icon: brand/app-icon.icns
+  target:
+    - dmg
+    - zip
+  # Ad-hoc signing keeps the downloaded app executable on current macOS
+  # while leaving developer ID/notarization for a release environment.
+  identity: '-'
+  binaries:
+    - Resources/restic/restic
+  hardenedRuntime: false
+  gatekeeperAssess: false
+dmg:
+  artifactName: Rewindle-${version}-${arch}.dmg
+  title: Rewindle
+  icon: brand/app-icon.icns
+  contents:
+    - x: 130
+      y: 220
+      type: file
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+  writeUpdateInfo: false
+  sign: false
+  internetEnabled: false
+artifactName: Rewindle-${version}-${arch}.${ext}
