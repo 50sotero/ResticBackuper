@@ -656,6 +656,10 @@ class MacBackupService extends EventEmitter {
     }
     const snapshotId = asString(payload.snapshotId);
     if (snapshotId && !/^[a-z0-9]{8,64}$/i.test(snapshotId)) throw new Error('Invalid snapshot ID.');
+    const requestedPath = asString(payload.path);
+    if (requestedPath && (!requestedPath.startsWith('/') || requestedPath.includes('\u0000'))) {
+      throw new Error('Restore paths must be absolute macOS paths.');
+    }
     const destination = normalizePath(asString(payload.destination));
     await this._validateRestoreDestination(destination);
     const password = await this._loadPassword();
@@ -668,7 +672,7 @@ class MacBackupService extends EventEmitter {
     try {
       await this._validateRestoreDestination(destination);
       const args = ['-r', this._config.repository, 'restore', snapshotId || 'latest', '--target', destination, '--json', '--verify'];
-      if (payload.path) args.push('--include', asString(payload.path));
+      if (requestedPath) args.push('--include', requestedPath);
       const result = await this._runRestic(args, { passwordFile });
       if (result.code !== 0) throw new Error(result.stderr.trim() || 'Restic restore failed.');
       this._setState({ status: this._status('success', 'Restore complete', `Restored data to ${safeDisplayPath(destination)}.`, { phaseIndex: 2, phaseLabel: 'Complete', progress: 1 }) });
