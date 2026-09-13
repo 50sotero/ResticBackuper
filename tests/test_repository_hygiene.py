@@ -163,6 +163,7 @@ class RepositoryHygieneTests(unittest.TestCase):
             "payload-manifest.json",
             "runtime-manifest.json",
             "scheduled-task.xml",
+            "google-drive-verification-task.xml",
         }
         allowed_binary_assets = {
             "src/dashboard/assets/dashboard-icon.ico",
@@ -255,6 +256,88 @@ class RepositoryHygieneTests(unittest.TestCase):
             (PROJECT / "VERSION").read_text(encoding="utf-8").strip(),
             r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$",
         )
+
+    def test_current_release_documents_match_version(self) -> None:
+        version = (PROJECT / "VERSION").read_text(encoding="utf-8").strip()
+        readme = (PROJECT / "README.md").read_text(encoding="utf-8")
+        architecture = (PROJECT / "docs" / "architecture.md").read_text(
+            encoding="utf-8"
+        )
+        release_notes = (
+            PROJECT / "docs" / f"release-notes-v{version}.md"
+        )
+
+        self.assertIn(f"**v{version} is an early public test release.**", readme)
+        self.assertIn(f"ResticBackuper-v{version}-windows-x64.zip", readme)
+        self.assertIn(f"ResticBackuper v{version} for Windows x64", architecture)
+        self.assertTrue(release_notes.is_file(), f"missing {release_notes.name}")
+        self.assertTrue(
+            release_notes.read_text(encoding="utf-8").startswith(
+                f"# ResticBackuper v{version}\n"
+            )
+        )
+
+    def test_runtime_inventory_allows_only_both_task_evidence_names(self) -> None:
+        primary = "scheduled-task.xml"
+        verification = "google-drive-verification-task.xml"
+        runtime_inventory_sources = (
+            PROJECT / "installer" / "Install-ResticBackuper.ps1",
+            PROJECT / "installer" / "Uninstall-ResticBackuper.ps1",
+            PROJECT / "src" / "credential_repair.py",
+            PROJECT / "src" / "install_google_drive_sync_task.ps1",
+            PROJECT / "src" / "Manage-Repository.ps1",
+            PROJECT / "src" / "Manage-Restore.ps1",
+            PROJECT / "src" / "Manage-Sources.ps1",
+        )
+        for path in runtime_inventory_sources:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                self.assertIn(primary, text)
+                self.assertIn(verification, text)
+
+    def test_release_payload_and_installer_require_complete_runtime(self) -> None:
+        builder = (PROJECT / "build" / "Build-Release.ps1").read_text(
+            encoding="utf-8"
+        )
+        installer = (
+            PROJECT / "installer" / "Install-ResticBackuper.ps1"
+        ).read_text(encoding="utf-8")
+        required = (
+            "backup.py",
+            "dry_run.py",
+            "initialize_repository.py",
+            "refresh_recovery_tools.py",
+            "recovery_health.py",
+            "credential_repair.py",
+            "stale_lock_repair.py",
+            "key_rotation.py",
+            "anomaly_review.py",
+            "restic_common.py",
+            "restore.py",
+            "secret_store.py",
+            "Manage-Sources.ps1",
+            "Manage-Schedule.ps1",
+            "Manage-Backup.ps1",
+            "Manage-Repository.ps1",
+            "Manage-Restore.ps1",
+            "ResticBackuperTaskLauncher.exe",
+            "ResticBackuperDashboard.exe",
+            "Uninstall-ResticBackuper.ps1",
+            "RECOVERY.md",
+            "restic-release.json",
+            "LICENSE",
+            "THIRD_PARTY_NOTICES.md",
+            "dependencies.json",
+            "licenses\\RESTIC.txt",
+            "licenses\\PYTHON.txt",
+        )
+        for relative in required:
+            with self.subTest(relative=relative):
+                self.assertIn(relative, builder)
+                self.assertIn(relative, installer)
+
+        self.assertIn("Assert-DotNetFramework48", installer)
+        self.assertIn("528040", installer)
 
 
 if __name__ == "__main__":

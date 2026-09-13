@@ -1,13 +1,14 @@
 # Social launch posts
 
 These drafts are ready to adapt and post. They describe the open-source alpha
-without implying that its separate off-site sync is a built-in feature.
+and keep the single streamed-repository tradeoffs explicit.
 
 ## X / Twitter
 
-I open-sourced ResticBackuper. Nightly: projects, local Google Drive mirror,
-Codex config + personal folders, minus reproducible output. Encrypted snapshots +
-verified canary restores; I separately sync the repo off-site to Drive. Alpha:
+ResticBackuper alpha.7 adds an explicit single-repository Google Drive for
+desktop mode, transactional DriveFS moves, exact API inventory checks, a
+nanosecond-safe latest-snapshot check, and a direct-cloud restore proof to
+encrypted incremental Windows backups:
 https://github.com/50sotero/ResticBackuper
 
 ## LinkedIn
@@ -15,25 +16,43 @@ https://github.com/50sotero/ResticBackuper
 I built **ResticBackuper** for the backup routine I actually wanted on my own
 Windows machine, and I have now released it as an open-source alpha.
 
-Every night, my setup protects software projects, a local Google Drive mirror,
-Codex configuration and home data, and personal folders. I exclude dependency
-trees, caches, and build outputs that can be reproduced from source and
-lockfiles, keeping the backup focused on original work and irreplaceable data.
+Every night, my setup protects software projects, cloud-synchronized working
+folders, Codex configuration and home data, and personal folders. I exclude
+dependency trees, caches, and build outputs that can be reproduced from source
+and lockfiles, keeping the backup focused on original work and irreplaceable
+data.
 
-The local layer uses an encrypted Restic repository for incremental snapshots
-and fast recovery. A run is not shown as successful until repository checks
-complete and a real canary file has been restored and its content verified. I
-also use a separate scheduled job to copy the encrypted repository off-site to
-Google Drive, with recovery material kept separately. That cloud-sync job is
-part of my deployment, not a feature the current installer configures.
+The core uses an encrypted Restic repository for incremental snapshots and
+recovery. A run is not shown as successful until repository checks complete and
+a real canary file has been restored and its content verified. The repository
+can stay on local NTFS, or an explicit opt-in mode can use one live path below
+Google Drive for desktop's My Drive streaming mount while keeping credentials,
+state, recovery tools, and the recovery key outside DriveFS.
+
+For that streamed mode, an optional verification-only task compares every live
+repository object with the read-only Google Drive API view and restores the
+canary through a direct cloud backend. It does not make or maintain a second
+repository mirror.
 
 ResticBackuper packages the reusable parts of that setup:
 
 - encrypted, incremental, deduplicated Restic snapshots
 - optional VSS capture for open files
-- daily Task Scheduler automation
-- a live dashboard with progress, throughput, ETA and run history
+- editable daily or selected-day Task Scheduler automation
+- protected **Back up now** and cooperative cancellation for the exact active run
+- a themed, accessible dashboard with progress, throughput, ETA and run history
 - UAC-protected folder management from the dashboard
+- a protected Restore Center bound to immutable snapshots and safe destinations
+- independent readiness checks for the active credential, recovery key,
+  portable tools, locks, capacity, and a real alternate-location restore
+- crash-safe repository relocation that verifies before activation and retains
+  the old repository
+- explicit single-repository DriveFS mode with transactional staged promotion
+- optional exact API inventory and independent direct-cloud restore evidence
+- guided credential repair, stale-lock cleanup, and rollback-preserving key
+  rotation
+- structured run details, overdue-backup detection, redacted diagnostics, and
+  explicit review for unusually destructive changes
 - repository structure checks
 - canary-restore verification before a run is marked successful
 - a separate recovery key for disaster recovery

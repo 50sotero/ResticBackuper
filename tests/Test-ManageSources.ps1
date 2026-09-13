@@ -113,6 +113,13 @@ function Assert-TransactionValid {
     $recoverySources = @($recovery.sources)
     Assert-True -Condition (($liveSources -join "`n") -ceq ($recoverySources -join "`n")) `
         -Message 'protected and recovery source lists match exactly'
+    Assert-True -Condition ([string]$live.plan_id -ceq [string]$recovery.plan_id) `
+        -Message 'protected and recovery plan identities match exactly'
+    Assert-True -Condition ([long]$live.config_generation -eq [long]$recovery.config_generation) `
+        -Message 'protected and recovery configuration generations match exactly'
+    Assert-True -Condition (($live.source_identities | ConvertTo-Json -Depth 10 -Compress) -ceq
+        ($recovery.source_identities | ConvertTo-Json -Depth 10 -Compress)) `
+        -Message 'protected and recovery source volume identities match exactly'
     $canaryMatches = @($liveSources | Where-Object { [string]$_ -ieq $script:canarySource })
     Assert-True -Condition ($canaryMatches.Count -eq 1) -Message 'protected canary remains exactly once'
     Assert-True -Condition ($liveSources.Count -ge 2) -Message 'at least one user source and canary remain'
@@ -276,6 +283,8 @@ try {
     $script:configPath = Join-Path $script:installRoot 'backup-config.json'
     $config = [ordered]@{
         schema_version = 1
+        plan_id = '11111111-1111-4111-8111-111111111111'
+        config_generation = 1
         repository = $repository
         repository_volume_serial = 'A1B2C3D4'
         restic_executable = Join-Path $script:installRoot 'restic.exe'
@@ -288,8 +297,14 @@ try {
         canary_file = $canary
         hostname = 'FIXTURE'
         scheduled_tag = 'scheduled'
+        cloud_placeholder_policy = 'strict'
         use_vss = $true
         sources = @($firstSource, $secondSource, $script:canarySource)
+        source_identities = [ordered]@{
+            $firstSource = [ordered]@{ expected_volume_serial = 'A1B2C3D4' }
+            $secondSource = [ordered]@{ expected_volume_serial = 'A1B2C3D4' }
+            $script:canarySource = [ordered]@{ expected_volume_serial = 'A1B2C3D4' }
+        }
     }
     Write-JsonFile -Path $script:configPath -Value $config
 
@@ -312,9 +327,21 @@ try {
         )
     }
     Write-JsonFile -Path $script:runtimeManifestPath -Value $runtimeManifest
+    [IO.File]::WriteAllText(
+        (Join-Path $script:installRoot 'scheduled-task.xml'),
+        "<primary-task-fixture />`n",
+        $encoding
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $script:installRoot 'google-drive-verification-task.xml'),
+        "<verification-task-fixture />`n",
+        $encoding
+    )
 
     $recoveryConfig = [ordered]@{
         schema_version = 1
+        plan_id = '11111111-1111-4111-8111-111111111111'
+        config_generation = 1
         repository = $repository
         repository_volume_serial = 'A1B2C3D4'
         restic_executable = 'X:\Standalone\restic.exe'
@@ -327,9 +354,15 @@ try {
         canary_file = $canary
         hostname = 'FIXTURE'
         scheduled_tag = 'scheduled'
+        cloud_placeholder_policy = 'strict'
         standalone_marker = 'preserve-me'
         use_vss = $true
         sources = @($firstSource, $secondSource, $script:canarySource)
+        source_identities = [ordered]@{
+            $firstSource = [ordered]@{ expected_volume_serial = 'A1B2C3D4' }
+            $secondSource = [ordered]@{ expected_volume_serial = 'A1B2C3D4' }
+            $script:canarySource = [ordered]@{ expected_volume_serial = 'A1B2C3D4' }
+        }
     }
     $script:recoveryConfigPath = Join-Path $script:recoveryRoot 'backup-config.json'
     $recoveryPayloads = @('restic.exe', 'restore.py', 'secret_store.py', 'RECOVERY.md', 'restic-release.json')

@@ -1,6 +1,10 @@
 [CmdletBinding()]
 param(
     [string]$Repository,
+    [ValidateSet('local_ntfs', 'google_drivefs_stream')]
+    [string]$RepositoryStorageMode = 'local_ntfs',
+    [string]$DriveFsMyDriveRoot,
+    [string]$DriveFsCacheDirectory,
     [string]$SourceList,
     [ValidatePattern('^([01]\d|2[0-3]):[0-5]\d$')]
     [string]$Schedule = '02:00',
@@ -26,6 +30,8 @@ if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitPr
 $productName = 'ResticBackuper'
 $backupTaskName = 'ResticBackuper'
 $dashboardTaskName = 'ResticBackuperDashboard'
+$primaryTaskEvidenceName = 'scheduled-task.xml'
+$cloudTaskEvidenceName = 'google-drive-verification-task.xml'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $payloadRoot = Join-Path $scriptRoot 'payload'
 $payloadManifestPath = Join-Path $scriptRoot 'payload-manifest.json'
@@ -52,6 +58,19 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Assert-DotNetFramework48 {
+    $frameworkKey = 'HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full'
+    try {
+        $release = [long](Get-ItemProperty -LiteralPath $frameworkKey -Name Release -ErrorAction Stop).Release
+    }
+    catch {
+        throw 'ResticBackuper requires the Microsoft .NET Framework 4.8 desktop runtime.'
+    }
+    if ($release -lt 528040) {
+        throw "ResticBackuper requires the Microsoft .NET Framework 4.8 desktop runtime (release 528040 or newer); found release $release."
+    }
+}
+
 function Quote-ProcessArgument {
     param([string]$Value)
     if ($Value.IndexOf([char]0) -ge 0 -or $Value.Contains('"')) {
@@ -69,6 +88,7 @@ function Invoke-SelfElevation {
         '-File', (Quote-ProcessArgument $PSCommandPath),
         '-Schedule', (Quote-ProcessArgument $Schedule),
         '-MinimumFreeGiB', [string]$MinimumFreeGiB,
+        '-RepositoryStorageMode', (Quote-ProcessArgument $RepositoryStorageMode),
         '-ExpectedUserSid', (Quote-ProcessArgument $sid)
     )
     if ($invocationParameters.ContainsKey('Repository')) {
@@ -76,6 +96,12 @@ function Invoke-SelfElevation {
     }
     if ($invocationParameters.ContainsKey('SourceList')) {
         $arguments += @('-SourceList', (Quote-ProcessArgument $SourceList))
+    }
+    if ($invocationParameters.ContainsKey('DriveFsMyDriveRoot')) {
+        $arguments += @('-DriveFsMyDriveRoot', (Quote-ProcessArgument $DriveFsMyDriveRoot))
+    }
+    if ($invocationParameters.ContainsKey('DriveFsCacheDirectory')) {
+        $arguments += @('-DriveFsCacheDirectory', (Quote-ProcessArgument $DriveFsCacheDirectory))
     }
     foreach ($switchName in @('DisableVss', 'SkipDashboard', 'StartBackup', 'Unattended')) {
         if ($invocationParameters.ContainsKey($switchName) -and [bool]$invocationParameters[$switchName]) {
@@ -224,14 +250,37 @@ function Assert-Payload {
         'Python\python.exe',
         'restic.exe',
         'initialize_repository.py',
+        'refresh_recovery_tools.py',
+        'recovery_health.py',
+        'credential_repair.py',
+        'stale_lock_repair.py',
+        'key_rotation.py',
+        'anomaly_review.py',
         'backup.py',
+        'dry_run.py',
         'restore.py',
+        'restic_common.py',
         'secret_store.py',
+        'verify_my_drive_cloud_repository.ps1',
+        'verify_cloud_repository_inventory.py',
+        'reveal-rclone-config-password.ps1',
+        'install_google_drive_sync_task.ps1',
         'excludes.txt',
         'backup-canary.txt',
+        'RECOVERY.md',
+        'restic-release.json',
         'Manage-Sources.ps1',
+        'Manage-Schedule.ps1',
+        'Manage-Backup.ps1',
+        'Manage-Repository.ps1',
+        'Manage-Restore.ps1',
         'ResticBackuperTaskLauncher.exe',
-        'Uninstall-ResticBackuper.ps1'
+        'Uninstall-ResticBackuper.ps1',
+        'LICENSE',
+        'THIRD_PARTY_NOTICES.md',
+        'dependencies.json',
+        'licenses\RESTIC.txt',
+        'licenses\PYTHON.txt'
     )
     if (-not $SkipDashboard) {
         $required += 'ResticBackuperDashboard.exe'
@@ -396,12 +445,79 @@ function Get-RepositoryVolume {
     if ($records.Count -ne 1 -or -not $records[0].VolumeSerialNumber) {
         throw "Could not read the repository volume serial: $root"
     }
+    if (-not ('ResticBackuperInstaller.NativeVolume' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+namespace ResticBackuperInstaller {
+  public static class NativeVolume {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern bool GetVolumeInformation(
+      string root, System.Text.StringBuilder volume, int volumeSize,
+      out uint serial, out uint maximumComponentLength, out uint fileSystemFlags,
+      System.Text.StringBuilder fileSystemName, int fileSystemNameSize);
+    public static UInt32[] Details(string root) {
+      uint serial, maximum, flags;
+      if (!GetVolumeInformation(root, null, 0, out serial, out maximum, out flags, null, 0))
+        throw new Win32Exception(Marshal.GetLastWin32Error());
+      return new UInt32[] { serial, maximum, flags };
+    }
+  }
+}
+'@
+    }
+    $details = [ResticBackuperInstaller.NativeVolume]::Details($root)
     return [ordered]@{
         root = $root
         serial = ([string]$records[0].VolumeSerialNumber).ToUpperInvariant()
         filesystem = [string]$drive.DriveFormat
         drive_type = [int]$drive.DriveType
         free_bytes = [long]$drive.AvailableFreeSpace
+        maximum_component_length = [long]$details[1]
+        filesystem_flags = [long]$details[2]
+    }
+}
+
+function Assert-NtfsProtectedPath {
+    param(
+        [string]$Path,
+        [string]$Label
+    )
+    $volume = Get-RepositoryVolume -Path $Path
+    if (-not [string]::Equals([string]$volume.filesystem, 'NTFS', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must remain on NTFS; observed $($volume.filesystem) at $($volume.root)"
+    }
+}
+
+function Assert-DriveFsProviderTransaction {
+    param([string]$Directory)
+    Assert-NormalDirectory -Path $Directory
+    $token = [Guid]::NewGuid().ToString('N')
+    $temporary = Join-Path $Directory ".resticbackuper-provider-$token.tmp"
+    $committed = Join-Path $Directory ".resticbackuper-provider-$token.commit"
+    $payload = [Text.Encoding]::ASCII.GetBytes("ResticBackuper DriveFS provider $token`n")
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $stream.Write($payload, 0, $payload.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        [IO.File]::Move($temporary, $committed)
+        if (-not [IO.File]::Exists($committed) -or [IO.File]::Exists($temporary)) {
+            throw 'Google DriveFS did not expose the provider probe rename.'
+        }
+        $observed = [IO.File]::ReadAllBytes($committed)
+        if ([Convert]::ToBase64String($observed) -cne [Convert]::ToBase64String($payload)) {
+            throw 'Google DriveFS provider probe readback differed from the committed payload.'
+        }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        foreach ($path in @($temporary, $committed)) {
+            if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+        }
     }
 }
 
@@ -426,7 +542,15 @@ function New-RuntimeManifest {
         [string]$Root,
         [string]$Version
     )
-    $files = @(Get-ChildItem -LiteralPath $Root -Recurse -File -Force | Where-Object Name -ne 'runtime-manifest.json' | Sort-Object FullName)
+    $files = @(
+        Get-ChildItem -LiteralPath $Root -Recurse -File -Force |
+            Where-Object Name -notin @(
+                'runtime-manifest.json',
+                $primaryTaskEvidenceName,
+                $cloudTaskEvidenceName
+            ) |
+            Sort-Object FullName
+    )
     $manifest = [ordered]@{
         schema_version = 1
         product = $productName
@@ -449,6 +573,7 @@ function New-RuntimeManifest {
 
 Assert-MicrosoftSignedExecutable -Path $windowsPowerShell
 Assert-MicrosoftSignedExecutable -Path $icacls
+Assert-DotNetFramework48
 
 if (-not (Test-Administrator)) {
     Invoke-SelfElevation
@@ -470,13 +595,46 @@ if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$') {
     throw "Payload version is invalid: $version"
 }
 
+$expectedDriveFsRoot = 'G:\My Drive'
+$expectedDriveFsCache = Join-Path ([Environment]::GetFolderPath(
+    [Environment+SpecialFolder]::LocalApplicationData)) 'Google\DriveFS'
+if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+    if ([string]::IsNullOrWhiteSpace($DriveFsMyDriveRoot)) {
+        $DriveFsMyDriveRoot = $expectedDriveFsRoot
+    }
+    if ([string]::IsNullOrWhiteSpace($DriveFsCacheDirectory)) {
+        $DriveFsCacheDirectory = $expectedDriveFsCache
+    }
+    $DriveFsMyDriveRoot = Get-NormalizedPath $DriveFsMyDriveRoot
+    $DriveFsCacheDirectory = Get-NormalizedPath $DriveFsCacheDirectory
+    if (-not [string]::Equals($DriveFsMyDriveRoot, $expectedDriveFsRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "google_drivefs_stream requires the exact My Drive root $expectedDriveFsRoot"
+    }
+    if (-not [string]::Equals($DriveFsCacheDirectory, $expectedDriveFsCache, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "drivefs_cache_directory must be the current user's Google DriveFS cache: $expectedDriveFsCache"
+    }
+}
+elseif ($invocationParameters.ContainsKey('DriveFsMyDriveRoot') -or
+    $invocationParameters.ContainsKey('DriveFsCacheDirectory')) {
+    throw 'DriveFS path parameters require -RepositoryStorageMode google_drivefs_stream.'
+}
+
 if (-not $Repository) {
     if ($Unattended) {
         throw '-Repository is required with -Unattended.'
     }
-    $defaultRepository = Get-DefaultRepository
+    $defaultRepository = if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+        Join-Path $DriveFsMyDriveRoot 'ResticBackups\Personal'
+    } else {
+        Get-DefaultRepository
+    }
     if ($defaultRepository) {
-        $answer = Read-Host "Repository path (prefer a separate physical NTFS drive) [$defaultRepository]"
+        $prompt = if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+            "Repository path strictly beneath $DriveFsMyDriveRoot [$defaultRepository]"
+        } else {
+            "Repository path (prefer a separate physical NTFS drive) [$defaultRepository]"
+        }
+        $answer = Read-Host $prompt
         $Repository = if ([string]::IsNullOrWhiteSpace($answer)) { $defaultRepository } else { $answer.Trim() }
     }
     else {
@@ -492,7 +650,16 @@ $repositoryParent = Split-Path -Parent $repositoryPath
 if (-not $repositoryParent) {
     throw 'Repository must not be a drive root.'
 }
-$recoveryTools = Join-Path $repositoryParent 'RecoveryTools'
+$recoveryTools = if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+    Join-Path $programDataRoot 'ResticBackuperRecoveryTools'
+} else {
+    Join-Path $repositoryParent 'RecoveryTools'
+}
+if ($RepositoryStorageMode -eq 'google_drivefs_stream' -and
+    ((-not (Test-IsWithin -Candidate $repositoryPath -Parent $DriveFsMyDriveRoot)) -or
+     [string]::Equals($repositoryPath, $DriveFsMyDriveRoot, [StringComparison]::OrdinalIgnoreCase))) {
+    throw "A google_drivefs_stream repository must be strictly beneath $DriveFsMyDriveRoot"
+}
 foreach ($protectedPath in @($installRoot, $stateRoot, $recoveryTools)) {
     if ((Test-IsWithin -Candidate $repositoryPath -Parent $protectedPath) -or (Test-IsWithin -Candidate $protectedPath -Parent $repositoryPath)) {
         throw "Repository overlaps a protected ResticBackuper path: $protectedPath"
@@ -503,6 +670,10 @@ Assert-NoReparsePath -Path $repositoryParent
 Assert-NoReparsePath -Path $recoveryTools -Recurse
 Assert-NoReparsePath -Path $installRoot
 Assert-NoReparsePath -Path $stateRoot -Recurse
+if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+    Assert-NoReparsePath -Path $DriveFsMyDriveRoot
+    Assert-NoReparsePath -Path $DriveFsCacheDirectory -Recurse
+}
 foreach ($existingDirectory in @($repositoryPath, $repositoryParent, $recoveryTools, $stateRoot)) {
     if (Test-Path -LiteralPath $existingDirectory) {
         Assert-NormalDirectory -Path $existingDirectory
@@ -579,6 +750,13 @@ if (-not $canaryAlreadyCovered) {
 foreach ($source in $configuredSources) {
     Assert-SourceDrive -Directory $source -UseVss $useVss
 }
+$sourceIdentities = [ordered]@{}
+foreach ($source in $configuredSources) {
+    $sourceVolume = Get-RepositoryVolume -Path $source
+    $sourceIdentities[$source] = [ordered]@{
+        expected_volume_serial = ([string]$sourceVolume.serial).ToUpperInvariant()
+    }
+}
 $recoveryKey = Join-Path $userProfileRoot 'ResticBackuper-RecoveryKey.txt'
 $secretFile = Join-Path $stateRoot 'repository-password.dpapi.json'
 Assert-NoReparsePath -Path $recoveryKey
@@ -592,9 +770,55 @@ if (Test-Path -LiteralPath $recoveryKey) {
     }
 }
 
+foreach ($protectedBinding in @(
+    @($installRoot, 'Protected runtime'),
+    @($stateRoot, 'ProgramData state'),
+    @($secretFile, 'DPAPI credential'),
+    @($recoveryKey, 'Recovery key'),
+    @($recoveryTools, 'Recovery tools')
+)) {
+    Assert-NtfsProtectedPath -Path $protectedBinding[0] -Label $protectedBinding[1]
+}
+
 $volume = Get-RepositoryVolume -Path $repositoryPath
-if ($volume.filesystem -ne 'NTFS') {
-    throw "The alpha installer requires an NTFS repository volume; observed $($volume.filesystem)."
+if ($RepositoryStorageMode -eq 'local_ntfs') {
+    if (-not [string]::Equals([string]$volume.filesystem, 'NTFS', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "local_ntfs requires an NTFS repository volume; observed $($volume.filesystem)."
+    }
+}
+else {
+    if (-not (Test-Path -LiteralPath $DriveFsMyDriveRoot -PathType Container)) {
+        throw "Google DriveFS My Drive is unavailable: $DriveFsMyDriveRoot"
+    }
+    Assert-NormalDirectory -Path $DriveFsMyDriveRoot
+    if (-not (Get-Process -Name GoogleDriveFS -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        throw 'Google DriveFS provider process is not running.'
+    }
+    if ([int]$volume.drive_type -ne [int][IO.DriveType]::Fixed -or
+        -not [string]::Equals([string]$volume.filesystem, 'FAT32', [StringComparison]::OrdinalIgnoreCase) -or
+        ([long]$volume.filesystem_flags -band 0x100) -eq 0 -or
+        [long]$volume.maximum_component_length -lt 64) {
+        throw 'The selected path is not the supported Google DriveFS streaming FAT32 mount.'
+    }
+    if (-not (Test-Path -LiteralPath $DriveFsCacheDirectory -PathType Container)) {
+        throw "Google DriveFS cache directory is unavailable: $DriveFsCacheDirectory"
+    }
+    Assert-NormalDirectory -Path $DriveFsCacheDirectory
+    Assert-NtfsProtectedPath -Path $DriveFsCacheDirectory -Label 'Google DriveFS cache'
+    $cacheFreeBytes = [long]([IO.DriveInfo]::new(
+        [IO.Path]::GetPathRoot($DriveFsCacheDirectory))).AvailableFreeSpace
+    $minimumCacheBytes = [Math]::Max([long]$MinimumFreeGiB * 1GB, [long]10GB)
+    if ($cacheFreeBytes -lt $minimumCacheBytes) {
+        throw "Google DriveFS cache has less than $([Math]::Round($minimumCacheBytes / 1GB, 1)) GiB free."
+    }
+    if (Test-Path -LiteralPath $repositoryPath -PathType Container) {
+        $oversized = Get-ChildItem -LiteralPath $repositoryPath -Recurse -File -Force |
+            Where-Object { $_.Length -ge [long]4GB } |
+            Select-Object -First 1
+        if ($oversized) {
+            throw "DriveFS cannot host a repository object of 4 GiB or larger: $($oversized.FullName)"
+        }
+    }
 }
 $minimumBytes = [long]$MinimumFreeGiB * 1GB
 if ($volume.free_bytes -lt $minimumBytes) {
@@ -619,6 +843,11 @@ foreach ($taskName in @($backupTaskName, $dashboardTaskName)) {
 Write-Host ''
 Write-Host "ResticBackuper $version installation summary" -ForegroundColor Cyan
 Write-Host "  Repository : $repositoryPath"
+Write-Host "  Storage    : $RepositoryStorageMode"
+if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+    Write-Host "  DriveFS    : $DriveFsMyDriveRoot"
+    Write-Host "  Cache      : $DriveFsCacheDirectory"
+}
 Write-Host "  Sources    : $($sources.Count)"
 foreach ($source in $sources) { Write-Host "    - $source" }
 if (-not $canaryAlreadyCovered) { Write-Host "    + protected restore canary ($canarySource)" }
@@ -628,7 +857,7 @@ Write-Host "  Dashboard  : $(-not $SkipDashboard)"
 Write-Host '  First run  : real backup only when explicitly requested'
 $systemVolume = [IO.Path]::GetPathRoot($systemDirectory)
 $repositoryOnSystemVolume = $volume.root -eq $systemVolume
-if ($repositoryOnSystemVolume) {
+if ($RepositoryStorageMode -eq 'local_ntfs' -and $repositoryOnSystemVolume) {
     Write-Warning 'The repository is on the Windows system volume. This does not protect against failure or loss of that volume; a separate physical drive is strongly recommended.'
 }
 if (-not $Unattended) {
@@ -641,6 +870,9 @@ if (-not $Unattended) {
 try {
     if (-not (Test-Path -LiteralPath $repositoryParent -PathType Container)) {
         New-Item -ItemType Directory -Path $repositoryParent -Force | Out-Null
+    }
+    if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+        Assert-DriveFsProviderTransaction -Directory $repositoryParent
     }
     New-Item -ItemType Directory -Path $installRoot | Out-Null
     $runtimeCreated = $true
@@ -675,7 +907,10 @@ try {
     $configPath = Join-Path $installRoot 'backup-config.json'
     $configuration = [ordered]@{
         schema_version = 1
+        plan_id = [Guid]::NewGuid().ToString('D')
+        config_generation = 1
         repository = $repositoryPath
+        repository_storage_mode = $RepositoryStorageMode
         repository_volume_serial = $volume.serial
         restic_executable = Join-Path $installRoot 'restic.exe'
         recovery_tools_directory = $recoveryTools
@@ -693,7 +928,20 @@ try {
         structural_check_after_backup = $true
         read_data_subset_weekday = 'Sunday'
         read_data_subset_parts = 30
+        cloud_placeholder_policy = 'strict'
+        change_anomaly = [ordered]@{
+            enabled = $true
+            file_change_ratio = 0.35
+            deletion_ratio = 0.15
+            data_added_ratio = 0.50
+            minimum_changed_files = 1000
+        }
         sources = @($configuredSources)
+        source_identities = $sourceIdentities
+    }
+    if ($RepositoryStorageMode -eq 'google_drivefs_stream') {
+        $configuration['drivefs_my_drive_root'] = $DriveFsMyDriveRoot
+        $configuration['drivefs_cache_directory'] = $DriveFsCacheDirectory
     }
     Write-Utf8NoBom -Path $configPath -Text ($configuration | ConvertTo-Json -Depth 5)
     $runtimeManifest = New-RuntimeManifest -Root $installRoot -Version $version
@@ -713,7 +961,9 @@ try {
 
     Set-ProtectedDirectory -Path $installRoot -UserSid $currentSid
     Set-ProtectedDirectory -Path $stateRoot -UserSid $currentSid
-    Set-ProtectedDirectory -Path $repositoryPath -UserSid $currentSid
+    if ($RepositoryStorageMode -eq 'local_ntfs') {
+        Set-ProtectedDirectory -Path $repositoryPath -UserSid $currentSid
+    }
     if (Test-Path -LiteralPath $recoveryTools -PathType Container) {
         Set-ProtectedDirectory -Path $recoveryTools -UserSid $currentSid
     }
@@ -733,7 +983,7 @@ try {
         $dashboardTrigger = New-ScheduledTaskTrigger -AtLogOn -User $identity.Name
         $dashboardSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
         $dashboardPrincipal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Limited
-        Register-ScheduledTask -TaskName $dashboardTaskName -Action $dashboardAction -Trigger $dashboardTrigger -Settings $dashboardSettings -Principal $dashboardPrincipal -Description 'Read-only ResticBackuper dashboard.' | Out-Null
+        Register-ScheduledTask -TaskName $dashboardTaskName -Action $dashboardAction -Trigger $dashboardTrigger -Settings $dashboardSettings -Principal $dashboardPrincipal -Description 'Least-privilege ResticBackuper dashboard with UAC-protected actions.' | Out-Null
         $dashboardTaskCreated = $true
 
         $shell = New-Object -ComObject WScript.Shell
@@ -790,6 +1040,7 @@ try {
         product = $productName
         version = $version
         repository = $repositoryPath
+        repository_storage_mode = $RepositoryStorageMode
         source_count = $configuredSources.Count
         user_source_count = $sources.Count
         schedule = $Schedule

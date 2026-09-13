@@ -28,6 +28,7 @@ from restic_common import (
     sha256_file,
     stream_command,
     utc_now,
+    validate_repository_storage_readiness,
     validate_repository_volume,
 )
 
@@ -55,6 +56,10 @@ def _run_locked(config: dict[str, Any]) -> int:
         "finished_utc": None,
         "wrapper_pid": os.getpid(),
         "repository": config["repository"],
+        "repository_storage_mode": config.get(
+            "repository_storage_mode", "local_ntfs"
+        ),
+        "repository_readiness": None,
         "repository_volume_serial": config["repository_volume_serial"],
         "sources": config["sources"],
         "exclude_file": config["exclude_file"],
@@ -73,6 +78,10 @@ def _run_locked(config: dict[str, Any]) -> int:
     }
     try:
         validate_repository_volume(config)
+        report["repository_readiness"] = validate_repository_storage_readiness(
+            config,
+            volume_validated=True,
+        )
         report["free_bytes_before"] = ensure_free_space(config)
         command = restic_base(config, json_output=True) + [
             "backup",

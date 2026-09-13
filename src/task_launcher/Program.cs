@@ -1,7 +1,10 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace ResticBackuper.TaskLauncher
@@ -10,10 +13,27 @@ namespace ResticBackuper.TaskLauncher
     {
         private const uint CreateSuspended = 0x00000004;
         private const uint CreateNoWindow = 0x08000000;
+        private const uint CreateUnicodeEnvironment = 0x00000400;
         private const uint Infinite = 0xFFFFFFFF;
         private const uint JobObjectLimitKillOnJobClose = 0x00002000;
         private const int JobObjectExtendedLimitInformationClass = 9;
         private const uint StillActive = 259;
+        private const uint WaitObject0 = 0;
+        private const uint WaitFailed = 0xFFFFFFFF;
+        private const uint QsAllInput = 0x04FF;
+        private const uint MwmoInputAvailable = 0x0004;
+        private const uint PmRemove = 0x0001;
+        private const uint WmClose = 0x0010;
+        private const uint ErrorAlreadyExists = 183;
+        private const uint SddlRevision1 = 1;
+        private const uint WsExToolWindow = 0x00000080;
+        private const uint WsExNoActivate = 0x08000000;
+        private const string CancelEventPrefix = "Local\\ResticBackuper.Cancel.";
+        private const string CancelEventSddl =
+            "O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)";
+
+        private static IntPtr activeCancellationEvent = IntPtr.Zero;
+        private static WindowProcedure windowProcedureRoot;
 
         [STAThread]
         private static int Main(string[] args)
@@ -42,9 +62,24 @@ namespace ResticBackuper.TaskLauncher
             }
 
             IntPtr job = IntPtr.Zero;
+            IntPtr window = IntPtr.Zero;
+            IntPtr environment = IntPtr.Zero;
+            string windowClass = null;
             ProcessInformation process = new ProcessInformation();
+            CancellationChannel channel = null;
             try
             {
+                channel = CancellationChannel.Create();
+                activeCancellationEvent = channel.Handle;
+
+                windowClass = "ResticBackuper.TaskLauncher." +
+                    channel.ChannelId.Substring(0, 16);
+                window = CreateCancellationWindow(windowClass);
+                if (window == IntPtr.Zero)
+                {
+                    return 77;
+                }
+
                 job = CreateJobObject(IntPtr.Zero, null);
                 if (job == IntPtr.Zero)
                 {
@@ -74,6 +109,11 @@ namespace ResticBackuper.TaskLauncher
                     Marshal.FreeHGlobal(informationPointer);
                 }
 
+                string launcherStartFileTime = GetCurrentProcessStartFileTime();
+                environment = BuildChildEnvironment(
+                    channel,
+                    GetCurrentProcessId(),
+                    launcherStartFileTime);
                 string commandLine = Quote(python)
                     + " -I -S -B -u " + Quote(backup)
                     + " --config " + Quote(config)
@@ -87,8 +127,8 @@ namespace ResticBackuper.TaskLauncher
                     IntPtr.Zero,
                     IntPtr.Zero,
                     false,
-                    CreateNoWindow | CreateSuspended,
-                    IntPtr.Zero,
+                    CreateNoWindow | CreateSuspended | CreateUnicodeEnvironment,
+                    environment,
                     runtime,
                     ref startup,
                     out process))
@@ -109,7 +149,7 @@ namespace ResticBackuper.TaskLauncher
 
                 CloseHandle(process.ThreadHandle);
                 process.ThreadHandle = IntPtr.Zero;
-                if (WaitForSingleObject(process.ProcessHandle, Infinite) == uint.MaxValue)
+                if (!WaitForProcessWithMessages(process.ProcessHandle))
                 {
                     TerminateAndWait(process.ProcessHandle, 72);
                     return 72;
@@ -136,8 +176,16 @@ namespace ResticBackuper.TaskLauncher
             {
                 return 76;
             }
+            catch (CryptographicException)
+            {
+                return 78;
+            }
             finally
             {
+                if (environment != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(environment);
+                }
                 if (process.ThreadHandle != IntPtr.Zero)
                 {
                     CloseHandle(process.ThreadHandle);
@@ -152,7 +200,152 @@ namespace ResticBackuper.TaskLauncher
                     // survived its direct Python supervisor.
                     CloseHandle(job);
                 }
+                if (window != IntPtr.Zero)
+                {
+                    DestroyWindow(window);
+                }
+                if (!string.IsNullOrEmpty(windowClass))
+                {
+                    UnregisterClass(windowClass, GetModuleHandle(null));
+                }
+                activeCancellationEvent = IntPtr.Zero;
+                if (channel != null)
+                {
+                    channel.Dispose();
+                }
+                GC.KeepAlive(windowProcedureRoot);
             }
+        }
+
+        private static IntPtr CreateCancellationWindow(string className)
+        {
+            windowProcedureRoot = new WindowProcedure(CancellationWindowProcedure);
+            WindowClass windowClass = new WindowClass();
+            windowClass.Size = (uint)Marshal.SizeOf(windowClass);
+            windowClass.Instance = GetModuleHandle(null);
+            windowClass.WindowProcedure = Marshal.GetFunctionPointerForDelegate(
+                windowProcedureRoot);
+            windowClass.ClassName = className;
+            if (RegisterClassEx(ref windowClass) == 0)
+            {
+                return IntPtr.Zero;
+            }
+            return CreateWindowEx(
+                WsExToolWindow | WsExNoActivate,
+                className,
+                string.Empty,
+                0,
+                0,
+                0,
+                0,
+                0,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                windowClass.Instance,
+                IntPtr.Zero);
+        }
+
+        private static IntPtr CancellationWindowProcedure(
+            IntPtr window,
+            uint message,
+            IntPtr wordParameter,
+            IntPtr longParameter)
+        {
+            if (message == WmClose)
+            {
+                if (activeCancellationEvent != IntPtr.Zero)
+                {
+                    SetEvent(activeCancellationEvent);
+                }
+                // Task Scheduler's cooperative close becomes the same protected
+                // request as the dashboard action. The supervisor remains alive.
+                return IntPtr.Zero;
+            }
+            return DefWindowProc(window, message, wordParameter, longParameter);
+        }
+
+        private static bool WaitForProcessWithMessages(IntPtr process)
+        {
+            IntPtr[] handles = new IntPtr[] { process };
+            while (true)
+            {
+                uint result = MsgWaitForMultipleObjectsEx(
+                    1,
+                    handles,
+                    Infinite,
+                    QsAllInput,
+                    MwmoInputAvailable);
+                if (result == WaitObject0)
+                {
+                    return true;
+                }
+                if (result == WaitObject0 + 1)
+                {
+                    Message message;
+                    while (PeekMessage(out message, IntPtr.Zero, 0, 0, PmRemove))
+                    {
+                        TranslateMessage(ref message);
+                        DispatchMessage(ref message);
+                    }
+                    continue;
+                }
+                if (result == WaitFailed)
+                {
+                    return false;
+                }
+                return false;
+            }
+        }
+
+        private static IntPtr BuildChildEnvironment(
+            CancellationChannel channel,
+            uint launcherPid,
+            string launcherStartFileTime)
+        {
+            SortedDictionary<string, string> variables =
+                new SortedDictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (DictionaryEntry item in Environment.GetEnvironmentVariables())
+            {
+                variables[Convert.ToString(item.Key)] = Convert.ToString(item.Value);
+            }
+            variables["RESTICBACKUPER_CANCEL_EVENT_NAME"] = channel.EventName;
+            variables["RESTICBACKUPER_CANCEL_CHANNEL_ID"] = channel.ChannelId;
+            variables["RESTICBACKUPER_CANCEL_CHANNEL_FINGERPRINT"] =
+                channel.ChannelFingerprint;
+            variables["RESTICBACKUPER_LAUNCHER_PID"] =
+                launcherPid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            variables["RESTICBACKUPER_LAUNCHER_START_FILETIME"] = launcherStartFileTime;
+
+            StringBuilder block = new StringBuilder();
+            foreach (KeyValuePair<string, string> item in variables)
+            {
+                block.Append(item.Key);
+                block.Append('=');
+                block.Append(item.Value);
+                block.Append('\0');
+            }
+            block.Append('\0');
+            return Marshal.StringToHGlobalUni(block.ToString());
+        }
+
+        private static string GetCurrentProcessStartFileTime()
+        {
+            FileTime creation;
+            FileTime exitTime;
+            FileTime kernelTime;
+            FileTime userTime;
+            if (!GetProcessTimes(
+                GetCurrentProcess(),
+                out creation,
+                out exitTime,
+                out kernelTime,
+                out userTime))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+            ulong value = ((ulong)creation.HighDateTime << 32) |
+                creation.LowDateTime;
+            return value.ToString(System.Globalization.CultureInfo.InvariantCulture);
         }
 
         private static string Quote(string value)
@@ -168,6 +361,148 @@ namespace ResticBackuper.TaskLauncher
             }
             TerminateProcess(process, exitCode);
             WaitForSingleObject(process, 10000);
+        }
+
+        private sealed class CancellationChannel : IDisposable
+        {
+            private CancellationChannel(
+                IntPtr handle,
+                string channelId,
+                string eventName,
+                string channelFingerprint)
+            {
+                Handle = handle;
+                ChannelId = channelId;
+                EventName = eventName;
+                ChannelFingerprint = channelFingerprint;
+            }
+
+            internal IntPtr Handle { get; private set; }
+            internal string ChannelId { get; private set; }
+            internal string EventName { get; private set; }
+            internal string ChannelFingerprint { get; private set; }
+
+            internal static CancellationChannel Create()
+            {
+                byte[] random = new byte[32];
+                using (RandomNumberGenerator generator = RandomNumberGenerator.Create())
+                {
+                    generator.GetBytes(random);
+                }
+                string channelId = LowerHex(random);
+                string eventName = CancelEventPrefix + channelId;
+                string fingerprint;
+                using (SHA256 digest = SHA256.Create())
+                {
+                    fingerprint = LowerHex(
+                        digest.ComputeHash(new UTF8Encoding(false).GetBytes(eventName)));
+                }
+
+                IntPtr descriptor;
+                uint descriptorLength;
+                if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
+                    CancelEventSddl,
+                    SddlRevision1,
+                    out descriptor,
+                    out descriptorLength))
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                try
+                {
+                    SecurityAttributes attributes = new SecurityAttributes();
+                    attributes.Length = Marshal.SizeOf(attributes);
+                    attributes.SecurityDescriptor = descriptor;
+                    attributes.InheritHandle = false;
+                    IntPtr handle = CreateEvent(
+                        ref attributes,
+                        true,
+                        false,
+                        eventName);
+                    int error = Marshal.GetLastWin32Error();
+                    if (handle == IntPtr.Zero)
+                    {
+                        throw new Win32Exception(error);
+                    }
+                    if ((uint)error == ErrorAlreadyExists)
+                    {
+                        CloseHandle(handle);
+                        throw new IOException("Cancellation event name unexpectedly existed.");
+                    }
+                    return new CancellationChannel(
+                        handle,
+                        channelId,
+                        eventName,
+                        fingerprint);
+                }
+                finally
+                {
+                    LocalFree(descriptor);
+                }
+            }
+
+            public void Dispose()
+            {
+                if (Handle != IntPtr.Zero)
+                {
+                    IntPtr handle = Handle;
+                    Handle = IntPtr.Zero;
+                    CloseHandle(handle);
+                }
+            }
+
+            private static string LowerHex(byte[] bytes)
+            {
+                StringBuilder value = new StringBuilder(bytes.Length * 2);
+                foreach (byte item in bytes)
+                {
+                    value.Append(item.ToString("x2", System.Globalization.CultureInfo.InvariantCulture));
+                }
+                return value.ToString();
+            }
+        }
+
+        [UnmanagedFunctionPointer(CallingConvention.Winapi)]
+        private delegate IntPtr WindowProcedure(
+            IntPtr window,
+            uint message,
+            IntPtr wordParameter,
+            IntPtr longParameter);
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WindowClass
+        {
+            public uint Size;
+            public uint Style;
+            public IntPtr WindowProcedure;
+            public int ClassExtra;
+            public int WindowExtra;
+            public IntPtr Instance;
+            public IntPtr Icon;
+            public IntPtr Cursor;
+            public IntPtr Background;
+            public string MenuName;
+            public string ClassName;
+            public IntPtr SmallIcon;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Message
+        {
+            public IntPtr Window;
+            public uint Value;
+            public UIntPtr WordParameter;
+            public IntPtr LongParameter;
+            public uint Time;
+            public Point Point;
+            public uint Private;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Point
+        {
+            public int X;
+            public int Y;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -238,6 +573,22 @@ namespace ResticBackuper.TaskLauncher
             public UIntPtr PeakJobMemoryUsed;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileTime
+        {
+            public uint LowDateTime;
+            public uint HighDateTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes
+        {
+            public int Length;
+            public IntPtr SecurityDescriptor;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool InheritHandle;
+        }
+
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         private static extern IntPtr CreateJobObject(IntPtr attributes, string name);
 
@@ -278,5 +629,95 @@ namespace ResticBackuper.TaskLauncher
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetCurrentProcess();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern uint GetCurrentProcessId();
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetProcessTimes(
+            IntPtr process,
+            out FileTime creation,
+            out FileTime exitTime,
+            out FileTime kernelTime,
+            out FileTime userTime);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string moduleName);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern ushort RegisterClassEx(ref WindowClass windowClass);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool UnregisterClass(string className, IntPtr instance);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateWindowEx(
+            uint extendedStyle,
+            string className,
+            string windowName,
+            uint style,
+            int x,
+            int y,
+            int width,
+            int height,
+            IntPtr parent,
+            IntPtr menu,
+            IntPtr instance,
+            IntPtr parameter);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyWindow(IntPtr window);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr DefWindowProc(
+            IntPtr window,
+            uint message,
+            IntPtr wordParameter,
+            IntPtr longParameter);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern uint MsgWaitForMultipleObjectsEx(
+            uint count,
+            IntPtr[] handles,
+            uint milliseconds,
+            uint wakeMask,
+            uint flags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool PeekMessage(
+            out Message message,
+            IntPtr window,
+            uint minimum,
+            uint maximum,
+            uint remove);
+
+        [DllImport("user32.dll")]
+        private static extern bool TranslateMessage(ref Message message);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr DispatchMessage(ref Message message);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateEvent(
+            ref SecurityAttributes attributes,
+            bool manualReset,
+            bool initialState,
+            string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetEvent(IntPtr handle);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(
+            string stringSecurityDescriptor,
+            uint stringSecurityDescriptorRevision,
+            out IntPtr securityDescriptor,
+            out uint securityDescriptorSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr LocalFree(IntPtr memory);
     }
 }

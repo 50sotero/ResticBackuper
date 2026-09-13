@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes ResticBackuper v0.1.0-alpha.2 for Windows x64. The
+This document describes ResticBackuper v0.1.0-alpha.8 for Windows x64. The
 design wraps Restic with conservative validation, Windows scheduling and VSS,
 local telemetry, and a recovery workflow. Restic remains the component that
 creates, encrypts, deduplicates, and restores repository snapshots.
@@ -14,13 +14,28 @@ flowchart LR
     L --> B
     K["CurrentUser DPAPI envelope"] -->|"password command"| R["Restic"]
     B --> R
-    R --> Q["User-selected local repository"]
+    R --> Q["User-selected local NTFS or explicit DriveFS repository"]
     B --> V["Snapshot, structure, data-subset,<br/>and canary-restore checks"]
     Q --> V
     B --> S["Atomic status and run-history JSON"]
     V --> S
+    Q -->|"DriveFS mode"| G["Google Drive cloud objects"]
+    W["03:00 protected cloud verifier"] -->|"read-only API inventory + direct restore"| G
+    W --> O2["Protected schema-2 cloud proof"]
+    O2 --> D
     S --> D["Read-only WPF dashboard"]
+    D -->|"confirmed Back up now + UAC"| T
     D -->|"UAC-approved add/remove"| M["Protected source manager"]
+    D -->|"reviewed schedule + UAC"| H["Protected schedule manager"]
+    H --> T
+    D -->|"run-bound cancel + UAC"| X["Protected cancel manager"]
+    X -->|"set protected per-run event"| B
+    B -->|"targeted Ctrl-Break"| R
+    D -->|"immutable snapshot + UAC"| E["Protected restore manager"]
+    E --> Z["New or empty restore target"]
+    D -->|"copy, verify, activate + UAC"| P["Protected repository manager"]
+    P --> Q2["Reviewed repository backend/location"]
+    D -->|"readiness and guided repair"| Y["Recovery health helpers"]
     M --> C["Protected backup configuration"]
     C --> B
     O["Offline recovery key"] -.->|"stored separately"| Q
@@ -65,9 +80,15 @@ restores of representative user data remain essential.
 | `ResticBackuperTaskLauncher.exe` | Supervises the scheduled Python/Restic process and ties descendants to a kill-on-close job object | None directly |
 | Embedded Python and `backup.py` | Validates configuration, drives Restic, verifies results, records status | Repository through Restic; protected state |
 | `restic.exe` | Creates encrypted snapshots, checks the repository, and restores data | Repository and explicit restore target |
-| `ResticBackuperDashboard.exe` | Reads status, logs, history, and configured sources; launches explicit UAC folder changes | No direct configuration or repository writes |
+| `ResticBackuperDashboard.exe` | Reads status, logs, history, and configured sources; launches explicit UAC folder changes; validates and requests the fixed backup task after confirmation | No direct configuration or repository writes |
 | `Manage-Sources.ps1` | Validates and transactionally adds/removes future backup sources while holding the run lock; a durable undo journal coordinates atomic per-file replacements | Protected configuration, protected journal, and recovery-tools metadata |
-| `restore.py` | Guards snapshot listing and restores to a non-overlapping new or empty target | Explicit restore target only |
+| `Manage-Schedule.ps1` | Applies a reviewed daily or selected-day trigger and supported task settings with fingerprint binding, verification, and rollback | Exact backup task definition only |
+| `Manage-Backup.ps1` | Revalidates the exact active run and protected task, then signals only that run's protected cancellation event | Per-run event signal and bound result file only |
+| `Manage-Repository.ps1` | Copies, manifest-checks, and atomically activates a reviewed local or explicit DriveFS repository destination; resumes or rolls back interrupted relocation | New repository, separate protected-NTFS recovery-tools destination, protected configuration, and journal |
+| `Manage-Restore.ps1` and `restore.py` | Bind browsing and restore requests to the current plan, generation, repository, and immutable snapshot ID; restore to a non-overlapping new or empty target | Explicit restore target and protected restore report only |
+| Recovery helpers | Inspect independent recovery paths and perform explicitly approved credential repair, stale-lock cleanup, key rotation, and anomaly acknowledgement | Narrow protected records or Restic credential/lock commands for the selected action |
+| `DiagnosticExporter.cs` | Builds a bounded support ZIP after removing secrets, identities, host names, command lines, and personal paths | User-selected diagnostic ZIP only |
+| Google Drive verifier | Holds the protected run lock, compares the sole DriveFS repository with a read-only API inventory, and restores the canary through a direct cloud backend | Protected verification runs/evidence only; no repository writes |
 | Installer/uninstaller | Installs protected runtime, creates tasks and shortcuts, manages application binaries | Program Files, ProgramData, Task Scheduler, registry, chosen repository during initialization |
 
 ## On-disk boundaries
@@ -82,32 +103,82 @@ ordinary users must not be able to replace files in this tree.
 ### `C:\ProgramData\ResticBackuper`
 
 Contains the CurrentUser DPAPI password envelope, protected restore canary, run
-lock, status records, JSONL logs, last-successful record, and local metrics
-history. During a folder-list change it may also contain the protected
-source-update undo journal. Writers run from the protected scheduled task or
-elevated source manager; the dashboard receives read access.
+lock, status records, structured failure detail, JSONL logs, last-successful
+record, and local metrics history. During protected changes it may also contain
+source-update, repository-relocation, or credential-rotation journals plus
+bounded result/evidence records. Writers run from the protected scheduled task
+or narrowly scoped elevated managers; the dashboard receives read access.
 
 ### User-selected repository
 
-Contains Restic's encrypted repository. The alpha installer accepts only a
-local fixed or removable NTFS drive-letter path and records its volume serial
-number. A separate physical drive is strongly recommended. Each run refuses
-to continue if the configured path resolves to a different volume, helping
-catch drive-letter reuse or accidental redirection.
+Contains Restic's encrypted repository. The default `local_ntfs` mode accepts a
+local fixed/removable NTFS drive-letter path. The explicit
+`google_drivefs_stream` mode accepts only a strict descendant of
+`G:\My Drive`, bound to the current user's `%LOCALAPPDATA%\Google\DriveFS`
+cache. Both modes record the volume serial. DriveFS additionally requires the
+provider process, fixed FAT32 mount and remote-storage capability, at least
+10 GiB of cache headroom, an atomic provider transaction, and repository
+objects strictly smaller than 4 GiB.
 
-The repository must not overlap a source. No automatic `forget`, `prune`, or
-repository deletion occurs in this release.
+The repository must not overlap a source. Relocation copies into a nonce-bound
+sibling stage and records an exact path/byte/SHA-256 commit-manifest digest in
+the protected journal. It verifies that inventory before and after copy,
+verifies repository ID, snapshot history, and structure, and only then
+same-parent-renames the stage and switches protected metadata atomically. A
+DriveFS destination must be absent, not merely empty, so rollback never depends
+on synthetic FAT32 ACL restoration. The old repository is retained. No
+automatic `forget`, `prune`, or repository deletion occurs.
 
 ### Recovery material
 
-The installer places a self-contained recovery-tools directory beside the
-repository and initially writes a plaintext recovery-key file to the installing
-user's profile root. The tools intentionally do not contain the
-password. The user must move the key to separate, secure storage.
+For `local_ntfs`, the installer places a self-contained recovery-tools directory
+beside the repository. For `google_drivefs_stream`, it places that bundle at
+`C:\ProgramData\ResticBackuperRecoveryTools`; recovery tools, the DPAPI
+envelope, ProgramData state, and the initially generated recovery key must all
+remain on NTFS outside DriveFS. Protected plan changes refresh the bundle
+transactionally. The tools intentionally do not contain the password. The user
+must move the key to separate, secure storage.
 
 The DPAPI envelope is convenient for unattended use on the current Windows
 profile. It is not a substitute for the recovery key: after loss of that
 profile, the envelope may be unusable.
+
+### Direct Google Drive verification
+
+For `google_drivefs_stream`, the live repository below the My Drive streaming
+mount is the only Restic repository path. The optional daily 03:00 task is
+verification-only; despite its compatibility task name, it does not copy to a
+local mirror.
+
+The Highest/Interactive verifier takes the existing byte-range run lock, derives
+the cloud path from the protected repository and My Drive configuration, and
+authenticates both the local mount and Google Drive API view as the same Restic
+repository. It requires an exact case-sensitive path, length, MD5, SHA-256, and
+provider-object-ID inventory before restoring the protected canary through the
+`rclone:` backend. That restore bypasses DriveFS and uses the complete snapshot
+ID from the latest successful backup.
+
+Rclone, its encrypted configuration, its CurrentUser-DPAPI configuration
+password, and the packaged reveal helper are copied into
+`C:\ProgramData\ResticBackuperCloudVerification`. A four-file size/hash
+manifest, Administrators ownership, protected inheritance, read-only
+normal-user ACL, and a no-reparse tree are checked before and after each run.
+The verifier never resolves those assets through `PATH` or a user-writable
+application-data directory. Native output is copied as bytes from redirected
+process streams so Windows PowerShell 5.1 cannot text-transform inventory JSON.
+Primary and verifier task exports use distinct generated evidence names, and
+are the only files exempt from the immutable runtime inventory. Task XML
+validation treats an omitted `Enabled` element as the schema default (`true`),
+while rejecting explicit false, malformed, or duplicate values. Replace-existing
+evidence and dashboard state use unique same-directory backup files because
+.NET Framework does not accept a null backup path for this operation.
+
+Immutable per-run evidence and an atomically replaced schema-2 latest proof
+remain in that protected tree. The dashboard accepts a green status only when
+the proof is post-activation and matches the current plan, configuration
+generation, repository path/ID, latest snapshot, exact inventory, protected
+asset manifest, and direct-cloud restore. Any newer backup attempt makes it
+stale. Legacy local-mirror status is explicitly rejected.
 
 ## Installer and supply chain
 
@@ -127,7 +198,7 @@ not guaranteed to reproduce the release ZIP byte for byte. The published
 SHA-256 identifies the exact frozen release artifact; it is an integrity value,
 not a reproducible-build claim.
 
-This is integrity checking, not publisher authentication. v0.1.0-alpha.2 has
+This is integrity checking, not publisher authentication. v0.1.0-alpha.8 has
 no Authenticode code signature, so users must obtain the checksum from the
 project's GitHub release, compare it locally, and decide whether they trust the
 project. A signed graphical installer is a future distribution goal, not a
@@ -151,9 +222,10 @@ Installation creates:
 
 The installer refuses an in-place alpha upgrade and refuses conflicting task
 names or an existing runtime. The conservative uninstaller removes only the
-application runtime, its verified scheduled tasks, shortcut, and uninstall
-registration. It preserves the repository, ProgramData state, DPAPI envelope,
-recovery key, and recovery tools.
+application runtime, its verified backup/dashboard/cloud-verification tasks,
+shortcut, and uninstall registration. It preserves the repository, ProgramData
+state, DPAPI envelope, recovery key, recovery tools, and protected cloud
+verification assets/evidence.
 
 The backup task uses an interactive logon token so CurrentUser DPAPI and the
 user profile are available. Scheduled runs therefore require the installing
@@ -169,6 +241,23 @@ tightens that policy to fixed NTFS volumes. UNC and network sources are never
 accepted. Removing a source changes future snapshots only; it never forgets or
 prunes existing snapshots.
 
+Each installed configuration has a random stable `plan_id` and a monotonically
+increasing `config_generation`. Elevated requests bind to both, the exact
+configuration hash, and the requesting Windows SID. Every configured source is
+also bound to its expected volume serial. The backup preflight rejects an
+offline source, a mismatched volume, nested/overlapping source topology, and by
+default a cloud placeholder that is not locally materialized. These checks
+prevent a reused drive letter or stale approval from silently changing scope.
+
+Cloud-placeholder classification uses per-call Win32 extended-length paths, so
+included names beyond `MAX_PATH` remain classifiable without changing the
+machine-wide registry policy. To keep the preflight aligned with the actual
+backup scope, it prunes only whole directories that are demonstrably covered
+by the active case-insensitive Restic exclusion file. A descendant that
+disappears during enumeration is recorded as a benign race; root loss,
+included access failures, unknown attributes, and included cloud-only content
+remain fatal.
+
 Before replacing any of the four coupled source-metadata files, the manager
 writes and flushes a protected undo journal containing the verified previous
 and proposed bytes for fixed target identities. Each file is then replaced
@@ -178,17 +267,100 @@ process termination or restart, the next manager invocation restores and
 verifies the complete previous set before deleting the journal. This avoids
 consuming a mixed live/recovery manifest set after an interrupted change.
 
+Schedule changes follow the same privilege boundary. The dashboard reads Task
+Scheduler as the source of truth, previews the requested policy, and launches a
+protected manager through UAC. The manager rejects a running backup, checks the
+baseline XML fingerprint, preserves fixed action/principal invariants, verifies
+the registered task, and rolls back on failure. The dashboard then performs an
+independent read before reporting success.
+
+Repository relocation uses the same global byte-range lock and plan binding.
+Local repository and recovery stages retain the protected NTFS ACL policy.
+DriveFS repository stages instead use an exact nonce path, ownership marker,
+and commit-manifest digest because its synthetic FAT32 ACL cannot carry that
+policy; the recovery stage still uses protected NTFS. The manager copies
+without deleting the old tree, checks every path/size/hash plus repository
+identity/history/structure, and revalidates final trees immediately before
+publishing configuration and manifest metadata. A flushed journal records
+destination ownership and every publication phase. If the process stops, the
+manager can return to the exact pre-change metadata while removing only a
+destination it proves through the journal, marker, and manifest.
+
+Restore requests are reviewed in the limited dashboard and executed through a
+separate elevated manager. Snapshot browsing returns bounded JSON. Plan-bound
+snapshots retain their plan and generation identity. A pre-plan snapshot is
+shown separately as **Legacy / unbound** only when it has no plan/generation
+tags and its computer, scheduled tags, and complete source set exactly match
+the current protected configuration. Legacy browsing and restore require the
+full immutable ID and a separately digest-bound opt-in; `latest` and ID prefixes
+cannot opt in. Snapshot metadata is never rewritten or retagged. The final
+request carries an exact immutable snapshot ID and the current configuration
+fingerprint. The destination must be absent or empty, local, and outside all
+sources, repository, runtime, and state paths. Restic receives `--overwrite
+never` and verification is required. A partial target is retained and labelled
+if the operation fails so potentially useful recovered data is not destroyed.
+
+Recovery Readiness authenticates the active DPAPI credential and separately
+parses and authenticates the configured recovery key. It also checks the
+portable bundle, repository capacity/identity, Restic locks, and protected
+restore-drill evidence. The normal-user dashboard can request a representative
+drill but never invokes Restic or reads either credential. A same-user
+UAC-elevated, request-digest-bound manager selects the exact latest verified
+plan-bound snapshot, derives a new nonce-bound protected destination, and uses
+the restricted recovery key to restore the protected canary plus a bounded
+ordinary-data sample with `--no-lock`, `--overwrite never`, and `--verify`.
+It independently checks the canary proof, expected file inventory, and sample
+sizes. Only then does it atomically append bounded protected history. Failed or
+partially verified output is retained for inspection without a passing history
+entry. Readiness rejects malformed, legacy, partial, different-plan, stale-
+generation, wrong-repository, or writable-by-the-user history. Credential
+repair is allowed only from a verified recovery key. Stale-lock cleanup
+delegates classification to Restic and removes only locks Restic confirms are
+stale. Key rotation adds and proves a new repository key before switching the
+DPAPI envelope and recovery document; the prior key and document remain
+available for rollback, and an interrupted local publication is resumed from a
+protected journal.
+
+Each launcher run creates a cryptographically random manual-reset cancellation
+event whose DACL permits only SYSTEM and Administrators to signal it. The event
+identity, launcher/wrapper process creation times, and run ID are written to
+protected status. After UAC, `Manage-Backup.ps1` revalidates those identities and
+the exact scheduled task before setting the event. Python supervises Restic in a
+dedicated console process group, sends one targeted `CTRL_BREAK_EVENT`, drains
+the JSON streams, and records `cancelled` only for Restic exit 130 or a safe
+between-phase checkpoint while no Restic child is running. If the child wins
+the race, exit 0 follows the normal verification path and any other exit remains
+a failure; the request itself is never treated as proof that a backup stopped.
+
 ## Failure behavior
 
 - A process-level run lock prevents concurrent wrapper runs.
 - A pending protected source-update journal makes backup runs fail closed. The
   next elevated source-manager invocation uses its undo records to restore and
   verify the complete pre-change metadata set before normal work continues.
+- Pending source-update, repository-relocation, plan-migration, or
+  credential-rotation journals block other protected mutations. Recovery is an
+  explicit state, not a best-effort background cleanup.
 - Restic retries repository locks for a bounded period.
 - State JSON is replaced atomically so the dashboard does not consume a
   partially written file.
 - A failed backup or verification leaves an error status and does not replace
-  the last-successful record.
+  the last-successful record. A bounded failure-detail document records the
+  failed phase and sanitized operator guidance; the dashboard never needs raw
+  credentials or command lines to explain a run.
+- Schedule-aware freshness is computed from the last verified run and installed
+  task policy, so an overdue backup is visible even when no process is active or
+  a heartbeat was lost.
+- A large destructive change anomaly can complete as a verified local snapshot
+  while remaining held for explicit review. Acknowledgement is bound to the
+  exact plan, generation, snapshot, and evidence and never alters snapshots.
+  The hold gates future destructive maintenance only; it cannot pause upload
+  from a repository that is already live below the DriveFS mount.
+- A cooperative cancellation leaves every prior snapshot intact, never updates
+  the last-successful record for the canceled run, and does not automatically
+  unlock, prune, or repair the repository. If the signal cannot be delivered,
+  the backup is left running and the dashboard reports that fact instead of
+  silently hard-killing it.
 - Installer rollback removes newly created application objects while
   preserving repository and recovery data.
 - Restore operations reject overlapping or non-empty targets and never need to
@@ -196,15 +368,19 @@ consuming a mixed live/recovery manifest set after an interrupted change.
 
 ## Boundaries and non-goals for the alpha
 
-- Only Windows x64 and local fixed/removable NTFS repositories are supported.
+- Only Windows x64, local fixed/removable NTFS repositories, and the explicitly
+  bound Google Drive for desktop `G:\My Drive` streaming backend are supported.
 - Sources must be existing folders on ready local fixed or removable
   drive-letter volumes; UNC and network sources are unsupported even when VSS
   is disabled.
 - VSS support is limited to local fixed NTFS source volumes. Disabling VSS can
   admit supported local removable or non-NTFS source volumes.
 - There is no code signature, automatic updater, or in-place upgrade.
-- There is no built-in cloud upload, off-site replication, retention, pruning,
-  or repository deletion workflow.
+- The installer validates an already configured Google Drive for desktop
+  streaming mount; it does not install Drive for desktop or choose an account.
+  The optional protected post-backup verifier supplies API inventory/direct
+  restore evidence for `google_drivefs_stream` only. No Computers-folder or
+  local mirror is created for `local_ntfs`.
 - Dashboard estimates are based on observed local telemetry and can change as
   file mix, cache state, and storage speed change.
 - Canary verification is deliberately narrow and does not replace full or

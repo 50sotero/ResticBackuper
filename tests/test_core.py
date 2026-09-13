@@ -41,10 +41,13 @@ class CoreSafetyTests(unittest.TestCase):
         canary = root / "canary.txt"
         canary.write_text("ResticBackuper test canary\n", encoding="utf-8")
         config_path = root / "backup-config.test.json"
+        configured_sources = [str(item) for item in (sources or [source])]
         config_path.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
+                    "plan_id": "11111111-1111-4111-8111-111111111111",
+                    "config_generation": 1,
                     "repository": str(repository),
                     "repository_volume_serial": "00000000",
                     "restic_executable": str(restic),
@@ -57,7 +60,12 @@ class CoreSafetyTests(unittest.TestCase):
                     "canary_file": str(canary),
                     "hostname": "RESTICBACKUPER-TEST",
                     "scheduled_tag": "scheduled-test",
-                    "sources": [str(item) for item in (sources or [source])],
+                    "cloud_placeholder_policy": "strict",
+                    "sources": configured_sources,
+                    "source_identities": {
+                        item: {"expected_volume_serial": "00000000"}
+                        for item in configured_sources
+                    },
                 }
             ),
             encoding="utf-8",
@@ -121,7 +129,7 @@ class CoreSafetyTests(unittest.TestCase):
                 sources=[source],
             )
 
-            with self.assertRaisesRegex(ValueError, "repository and source overlap"):
+            with self.assertRaisesRegex(ValueError, "(?:repository and source|source and repository) overlap"):
                 restic_common.load_config(config_path, require_repository=False)
 
     def test_load_config_rejects_unsafe_exclusion(self) -> None:
@@ -208,6 +216,11 @@ class CoreSafetyTests(unittest.TestCase):
             self.assertTrue(paused.wait(timeout=10), "worker did not reach pre-lock pause")
             with restic_common.RunLock(state / "run.lock"):
                 config["sources"] = [str(old_source), str(new_source)]
+                config["source_identities"] = {
+                    str(old_source): {"expected_volume_serial": "00000000"},
+                    str(new_source): {"expected_volume_serial": "00000000"},
+                }
+                config["config_generation"] += 1
                 config_path.write_text(json.dumps(config), encoding="utf-8")
             continue_to_lock.set()
             thread.join(timeout=10)
@@ -318,11 +331,17 @@ class CoreSafetyTests(unittest.TestCase):
         config = {
             "hostname": "Backup-Host",
             "sources": [r"C:\BackupSource\Documents", r"D:\Projects"],
+            "plan_id": "11111111-1111-4111-8111-111111111111",
+            "config_generation": 1,
         }
         older = {
             "id": "older",
             "hostname": "BACKUP-HOST",
-            "tags": ["scheduled"],
+            "tags": [
+                "scheduled",
+                "restic-backuper-plan:11111111-1111-4111-8111-111111111111",
+                "restic-backuper-generation:1",
+            ],
             "paths": [r"d:\projects", r"c:\backupsource\documents"],
             "time": "2026-01-01T01:00:00Z",
         }

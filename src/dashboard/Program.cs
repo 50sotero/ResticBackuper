@@ -57,7 +57,8 @@ namespace ResticBackuper.Dashboard
             if (principal.IsInRole(WindowsBuiltInRole.Administrator))
             {
                 MessageBox.Show(
-                    "This read-only dashboard intentionally runs without administrator privileges. " +
+                    "This dashboard intentionally runs without administrator privileges. " +
+                    "Protected folder changes and manual backup requests ask for Windows approval when needed. " +
                     "Please launch it normally instead of using Run as administrator.",
                     "ResticBackuper Dashboard",
                     MessageBoxButton.OK,
