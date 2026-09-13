@@ -589,6 +589,7 @@ class MacBackupService extends EventEmitter {
       }),
     });
     try {
+      await this._validateRestoreDestination(destination);
       const args = ['-r', this._config.repository, 'restore', snapshotId || 'latest', '--target', destination, '--json'];
       if (payload.path) args.push('--include', asString(payload.path));
       const result = await this._runRestic(args, { passwordFile });
@@ -722,14 +723,17 @@ class MacBackupService extends EventEmitter {
 
   async _validateSourceSelection(values, repository = this._config?.repository) {
     const sources = [...new Set(values.map(normalizePath))];
+    const canonicalSources = new Map();
+    for (const source of sources) canonicalSources.set(source, await this._canonicalPath(source));
+    const canonicalRepository = repository ? await this._canonicalPath(repository) : '';
     for (const source of sources) {
       const stat = await fs.stat(source).catch(() => null);
       if (!stat || !stat.isDirectory()) throw new Error(`Protected folder does not exist or is not a directory: ${safeDisplayPath(source)}`);
-      if (repository && pathsOverlap(source, repository)) throw new Error('A protected folder cannot contain the Restic repository.');
+      if (repository && pathsOverlap(canonicalSources.get(source), canonicalRepository)) throw new Error('A protected folder cannot contain the Restic repository.');
     }
     for (let i = 0; i < sources.length; i += 1) {
       for (let j = i + 1; j < sources.length; j += 1) {
-        if (pathsOverlap(sources[i], sources[j])) throw new Error('Protected folders cannot overlap each other.');
+        if (pathsOverlap(canonicalSources.get(sources[i]), canonicalSources.get(sources[j]))) throw new Error('Protected folders cannot overlap each other.');
       }
     }
     return sources;
@@ -738,8 +742,9 @@ class MacBackupService extends EventEmitter {
   async _validateRepositorySelection(repository, sources = this._config?.sources || []) {
     const stat = await fs.stat(repository).catch(() => null);
     if (stat && !stat.isDirectory()) throw new Error('The repository path must be a folder.');
+    const canonicalRepository = await this._canonicalPath(repository);
     for (const source of sources) {
-      if (pathsOverlap(repository, source)) throw new Error('The Restic repository cannot overlap a protected folder.');
+      if (pathsOverlap(canonicalRepository, await this._canonicalPath(source))) throw new Error('The Restic repository cannot overlap a protected folder.');
     }
     if (stat) {
       const entries = await fs.readdir(repository).catch(() => []);
@@ -762,14 +767,18 @@ class MacBackupService extends EventEmitter {
   async _validateRestoreDestination(destination) {
     if (!isAbsolutePath(destination)) throw new Error('Restore destination must be a full macOS path.');
     if (path.resolve(destination) === path.parse(destination).root) throw new Error('Restore destination cannot be the filesystem root.');
-    if (this._config?.repository && pathsOverlap(destination, this._config.repository)) throw new Error('Restore destination cannot overlap the Restic repository.');
+    const canonicalDestination = await this._canonicalPath(destination);
+    if (this._config?.repository && pathsOverlap(canonicalDestination, await this._canonicalPath(this._config.repository))) throw new Error('Restore destination cannot overlap the Restic repository.');
     for (const source of this._config?.sources || []) {
-      if (pathsOverlap(destination, source)) throw new Error('Restore destination cannot overlap a protected folder.');
+      if (pathsOverlap(canonicalDestination, await this._canonicalPath(source))) throw new Error('Restore destination cannot overlap a protected folder.');
     }
     const stat = await fs.stat(destination).catch(() => null);
     if (stat && !stat.isDirectory()) throw new Error('Restore destination must be a folder.');
     if (stat && (await fs.readdir(destination)).length) throw new Error('Restore destination must be empty.');
     if (!stat) await fs.mkdir(destination, { recursive: true, mode: 0o700 });
+    // Re-read after creating a new target so a race that populated the folder
+    // between validation and creation cannot turn into an implicit merge.
+    if ((await fs.readdir(destination)).length) throw new Error('Restore destination must be empty.');
   }
 
   async _verifyCanary(snapshotId, passwordFile) {
@@ -1207,6 +1216,19 @@ class MacBackupService extends EventEmitter {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  async _canonicalPath(value) {
+    try {
+      return await fs.realpath(value);
+    } catch {
+      const parent = path.dirname(value);
+      try {
+        return path.join(await fs.realpath(parent), path.basename(value));
+      } catch {
+        return path.resolve(value);
+      }
     }
   }
 
