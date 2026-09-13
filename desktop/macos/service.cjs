@@ -320,7 +320,7 @@ class MacBackupService extends EventEmitter {
       case 'addSource': return this._queue('addSource', () => this.addSource());
       case 'removeSource': return this._queue('removeSource', () => this.removeSource(payload));
       case 'editSchedule': return this._queue('editSchedule', () => this.editSchedule(payload));
-      case 'changeRepository': return this._queue('changeRepository', () => this.changeRepository());
+      case 'changeRepository': return this._unsupported('Changing repositories is not available in this release. Choose a new plan only after exporting your recovery key.');
       case 'repairRepository': return this._unsupported('Repository repair is intentionally unavailable in this release.');
       case 'reviewChanges': return this._unsupported('Destructive repository changes are intentionally unavailable in this release.');
       case 'openRestore': return payload.destination
@@ -495,6 +495,9 @@ class MacBackupService extends EventEmitter {
 
   async editSchedule(payload = {}) {
     await this._ensureConfigured(false);
+    if (!this.scheduler || typeof this.scheduler.installDailyLaunchAgent !== 'function') {
+      throw new Error('Automatic scheduling is unavailable on this macOS host.');
+    }
     let time = payload.time ? validateTime(payload.time) : '';
     if (!time) {
       time = validateTime(normalizeInput(await this._callUi('input', {
@@ -504,10 +507,19 @@ class MacBackupService extends EventEmitter {
         value: this._config.schedule.time,
       })));
     }
-    this._config = { ...this._config, schedule: { enabled: true, time }, updated: isoNow() };
-    await this._writeConfig(this._config);
-    if (this.scheduler && typeof this.scheduler.installDailyLaunchAgent === 'function') {
-      await this.scheduler.installDailyLaunchAgent({ time });
+    const previousConfig = this._config;
+    await this.scheduler.installDailyLaunchAgent({ time });
+    try {
+      this._config = { ...previousConfig, schedule: { enabled: true, time }, updated: isoNow() };
+      await this._writeConfig(this._config);
+    } catch (error) {
+      this._config = previousConfig;
+      try {
+        await this.scheduler.installDailyLaunchAgent({ time: previousConfig.schedule.time });
+      } catch {
+        // Keep the old in-memory configuration and surface the write failure.
+      }
+      throw error;
     }
     this._state = this._buildState(this._state.page);
     this._emitState();
@@ -571,6 +583,67 @@ class MacBackupService extends EventEmitter {
     return this.getState();
   }
 
+  /**
+   * Read-only restore browser data for the Electron Restore Center.
+   * Values are projected to the fields the UI needs; Restic's raw JSON is not
+   * forwarded wholesale because it can contain host and username metadata.
+   */
+  async listRestoreSnapshots() {
+    await this._ensureConfigured(false);
+    const password = await this._loadPassword(false);
+    const passwordFile = await this._createPasswordFile(password);
+    try {
+      const result = await this._runRestic(['-r', this._config.repository, 'snapshots', '--json'], { passwordFile });
+      if (result.code !== 0) throw new Error(result.stderr.trim() || 'Restic could not list snapshots.');
+      let parsed;
+      try {
+        parsed = JSON.parse(result.stdout.trim() || '[]');
+      } catch {
+        parsed = result.stdout.split(/\r?\n/).map(parseJsonLine).filter(Boolean);
+      }
+      const snapshots = Array.isArray(parsed) ? parsed : [];
+      return snapshots.filter((snapshot) => typeof snapshot?.id === 'string').map((snapshot) => ({
+        id: snapshot.id,
+        shortId: typeof snapshot.short_id === 'string' ? snapshot.short_id : snapshot.id.slice(0, 8),
+        time: typeof snapshot.time === 'string' ? snapshot.time : '',
+        hostname: typeof snapshot.hostname === 'string' ? snapshot.hostname : '',
+        paths: Array.isArray(snapshot.paths) ? snapshot.paths.filter((entry) => typeof entry === 'string') : [],
+        tags: Array.isArray(snapshot.tags) ? snapshot.tags.filter((entry) => typeof entry === 'string') : [],
+      }));
+    } finally {
+      await this._removeRuntimeFile(passwordFile);
+    }
+  }
+
+  async listRestoreEntries(snapshotId, entryPath = '') {
+    await this._ensureConfigured(false);
+    const id = asString(snapshotId);
+    if (!/^(latest|[a-z0-9]{8,64})$/i.test(id)) throw new Error('Invalid snapshot ID.');
+    const requestedPath = asString(entryPath);
+    if (requestedPath && (!requestedPath.startsWith('/') || requestedPath.includes('\u0000'))) {
+      throw new Error('Restore browser paths must be absolute macOS paths.');
+    }
+    const password = await this._loadPassword(false);
+    const passwordFile = await this._createPasswordFile(password);
+    try {
+      const args = ['-r', this._config.repository, 'ls', id, '--json', '--recursive'];
+      if (requestedPath) args.push(requestedPath);
+      const result = await this._runRestic(args, { passwordFile });
+      if (result.code !== 0) throw new Error(result.stderr.trim() || 'Restic could not list snapshot contents.');
+      const entries = result.stdout.split(/\r?\n/).map(parseJsonLine).filter((entry) => entry && (entry.message_type === 'node' || entry.struct_type === 'node'));
+      return entries.map((entry) => ({
+        path: typeof entry.path === 'string' ? entry.path : '',
+        name: typeof entry.name === 'string' ? entry.name : '',
+        type: typeof entry.type === 'string' ? entry.type : 'unknown',
+        size: finiteNumber(entry.size),
+        mtime: typeof entry.mtime === 'string' ? entry.mtime : '',
+        permissions: typeof entry.permissions === 'string' ? entry.permissions : '',
+      })).filter((entry) => entry.path);
+    } finally {
+      await this._removeRuntimeFile(passwordFile);
+    }
+  }
+
   async openRestore(payload = {}) {
     await this._ensureConfigured(false);
     if (!payload.destination) {
@@ -590,7 +663,7 @@ class MacBackupService extends EventEmitter {
     });
     try {
       await this._validateRestoreDestination(destination);
-      const args = ['-r', this._config.repository, 'restore', snapshotId || 'latest', '--target', destination, '--json'];
+      const args = ['-r', this._config.repository, 'restore', snapshotId || 'latest', '--target', destination, '--json', '--verify'];
       if (payload.path) args.push('--include', asString(payload.path));
       const result = await this._runRestic(args, { passwordFile });
       if (result.code !== 0) throw new Error(result.stderr.trim() || 'Restic restore failed.');
@@ -692,7 +765,7 @@ class MacBackupService extends EventEmitter {
       sources,
       canaryPath,
       canaryHash,
-      schedule: { enabled: true, time: '02:00' },
+      schedule: { enabled: false, time: '02:00' },
       recoveryKeyPath: typeof recoveryPath === 'string' ? normalizePath(recoveryPath) : '',
       created: isoNow(),
       updated: isoNow(),
@@ -711,11 +784,18 @@ class MacBackupService extends EventEmitter {
       await this._removeCredential();
       throw error;
     }
+    if (this.scheduler && typeof this.scheduler.installDailyLaunchAgent === 'function') {
+      try {
+        await this.scheduler.installDailyLaunchAgent({ time: config.schedule.time });
+        config.schedule.enabled = true;
+      } catch {
+        // Keep the completed repository setup usable while accurately showing
+        // that launchd could not be installed on this host.
+        config.schedule.enabled = false;
+      }
+    }
     this._config = config;
     await this._writeConfig(config);
-    if (this.scheduler && typeof this.scheduler.installDailyLaunchAgent === 'function') {
-      await this.scheduler.installDailyLaunchAgent({ time: config.schedule.time });
-    }
     this._state = this._buildState(this._state?.page || 'Protection');
     this._emitState();
     return config;
@@ -785,7 +865,7 @@ class MacBackupService extends EventEmitter {
     if (!this._config?.canaryPath || !this._config.canaryHash) return;
     const restoreRoot = await fs.mkdtemp(path.join(this.dataDir, 'canary-verify-'));
     try {
-      const result = await this._runRestic(['-r', this._config.repository, 'restore', snapshotId, '--target', restoreRoot, '--json'], { passwordFile });
+      const result = await this._runRestic(['-r', this._config.repository, 'restore', snapshotId, '--target', restoreRoot, '--json', '--verify'], { passwordFile });
       if (result.code !== 0) throw new Error(result.stderr.trim() || 'Restic could not restore the canary file.');
       const name = path.basename(this._config.canaryPath);
       const candidate = await this._findFile(restoreRoot, name);
@@ -983,6 +1063,7 @@ class MacBackupService extends EventEmitter {
     actions.removeSource = normalizeAction(configured && !active, 'Remove folder', 'Remove this folder from future backups.');
     actions.editSchedule = normalizeAction(configured && !active, 'Edit schedule', 'Change the daily launchd schedule.');
     actions.changeRepository = normalizeAction(configured && !active, 'Change repository', 'Choose a different Restic repository.');
+    actions.changeRepository = normalizeAction(false, 'Change repository', 'Changing repositories is not available in this release.', false);
     actions.openRestore = normalizeAction(configured && !active, 'Open restore', 'Open the restore workflow.');
     actions.checkReadiness = normalizeAction(configured && !active, 'Check readiness', 'Check repository and recovery readiness.');
     actions.exportDiagnostics = normalizeAction(true, 'Export diagnostics', 'Save redacted diagnostic information.');

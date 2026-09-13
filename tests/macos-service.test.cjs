@@ -92,6 +92,21 @@ function fakeResticRunner({ root, keepBackupOpen = false } = {}) {
           await fs.copyFile(source, path.join(target, path.basename(source))).catch(() => undefined);
         }
       }
+      if (command === 'snapshots') {
+        child.stdout.write(`${JSON.stringify([{ id: '1234567890abcdef', short_id: '12345678', time: '2026-09-13T02:00:00Z', hostname: 'test-host', paths: ['/tmp/source'], tags: ['proofhold'] }])}\n`);
+        child.stdout.end();
+        child.stderr.end();
+        child.emit('close', 0, null);
+        return;
+      }
+      if (command === 'ls') {
+        child.stdout.write(`${JSON.stringify({ message_type: 'snapshot', struct_type: 'snapshot', id: '1234567890abcdef' })}\n`);
+        child.stdout.write(`${JSON.stringify({ message_type: 'node', struct_type: 'node', name: 'hello.txt', type: 'file', path: '/tmp/source/hello.txt', size: 5, mtime: '2026-09-13T02:00:00Z' })}\n`);
+        child.stdout.end();
+        child.stderr.end();
+        child.emit('close', 0, null);
+        return;
+      }
       child.stdout.write(`${JSON.stringify({ message_type: 'summary' })}\n`);
       child.stdout.end();
       child.stderr.end();
@@ -211,6 +226,29 @@ test('restore rejects non-empty and overlapping destinations before invoking Res
   assert.equal(runner.calls.some((call) => call.args[2] === 'restore'), false);
 });
 
+test('restore browser returns projected snapshot and entry data, and restore requests content verification', async () => {
+  const root = await tempDir('proofhold-browser-');
+  const runner = fakeResticRunner({ root });
+  const { service } = await makeConfiguredService(root, runner);
+  const snapshots = await service.listRestoreSnapshots();
+  assert.deepEqual(snapshots[0], {
+    id: '1234567890abcdef',
+    shortId: '12345678',
+    time: '2026-09-13T02:00:00Z',
+    hostname: 'test-host',
+    paths: ['/tmp/source'],
+    tags: ['proofhold'],
+  });
+  const entries = await service.listRestoreEntries('1234567890abcdef');
+  assert.equal(entries[0].path, '/tmp/source/hello.txt');
+  assert.equal(entries[0].size, 5);
+  const destination = path.join(root, 'restore');
+  const restored = await service.execute('openRestore', { snapshotId: '1234567890abcdef', destination });
+  assert.equal(restored.status.success, true);
+  const restoreCall = runner.calls.find((call) => call.args[2] === 'restore');
+  assert.ok(restoreCall.args.includes('--verify'));
+});
+
 test('scheduler writes an escaped user LaunchAgent with exact HH:mm and safe argument arrays', async () => {
   assert.equal(validateScheduleTime('02:05'), '02:05');
   assert.throws(() => validateScheduleTime('2:05'), /HH:mm/);
@@ -245,5 +283,6 @@ test('scheduler writes an escaped user LaunchAgent with exact HH:mm and safe arg
   const installed = await scheduler.readDailyLaunchAgent();
   assert.deepEqual(installed.time, '23:45');
   await scheduler.removeDailyLaunchAgent();
+  assert.deepEqual(launcherCalls.at(-1).args, ['bootout', 'gui/501/com.proofhold.backup']);
   await assert.rejects(() => fs.access(result.path));
 });
