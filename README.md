@@ -446,7 +446,7 @@ is not a reproducible-build claim.
 .\tests\Test-ReleaseArtifact.ps1
 ```
 
-The macOS build runs on a Mac runner for each architecture. From `desktop/`:
+The macOS build runs on a Mac runner for each architecture. From the repository root:
 
 ```bash
 npm ci

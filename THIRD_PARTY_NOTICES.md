@@ -51,6 +51,6 @@ The macOS desktop app uses Electron 43.7.0 and electron-builder 26.16.1. The
 Electron distribution contains its own Chromium, Node.js, and transitive
 dependency notices; the macOS packaging step copies those notices into the
 application or release bundle as required by the upstream packages. The exact
-versions are pinned in `desktop/package-lock.json`, and the release workflow
+versions are pinned in the root `package-lock.json`, and the release workflow
 does not claim Developer ID signing or notarization without explicitly
 configured Apple credentials.
