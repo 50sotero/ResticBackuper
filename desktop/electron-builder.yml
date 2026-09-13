@@ -35,7 +35,7 @@ mac:
   # while leaving developer ID/notarization for a release environment.
   identity: '-'
   binaries:
-    - Resources/restic/restic
+    - Contents/Resources/restic/restic
   hardenedRuntime: false
   gatekeeperAssess: false
 dmg:

@@ -342,7 +342,7 @@ function Ensure-WebView2Runtime {
         Write-Host 'Microsoft Edge WebView2 Runtime is missing; downloading the Microsoft bootstrapper.' -ForegroundColor Yellow
         Invoke-WebRequest -UseBasicParsing -Uri $webView2BootstrapperUri -OutFile $bootstrapper
         Assert-MicrosoftSignedExecutable -Path $bootstrapper
-        $process = Start-Process -FilePath $bootstrapper -ArgumentList @('/silent', '/install') -Wait -PassThru
+        $process = Start-Process -FilePath $bootstrapper -ArgumentList @('/silent', '/install') -WindowStyle Hidden -Wait -PassThru
         if ($process.ExitCode -ne 0) {
             throw "WebView2 Runtime bootstrapper failed with exit code $($process.ExitCode)."
         }

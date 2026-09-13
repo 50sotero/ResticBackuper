@@ -65,6 +65,7 @@ jobs:
             desktop/dist/*.zip
             desktop/dist/SHA256SUMS-*.txt
             desktop/dist/smoke-test.json
+            desktop/dist/smoke-*.png
 
   windows:
     name: Windows x64
