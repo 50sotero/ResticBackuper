@@ -825,15 +825,25 @@ class MacBackupService extends EventEmitter {
       throw error;
     }
     if (this.scheduler && typeof this.scheduler.installDailyLaunchAgent === 'function') {
+      let scheduleInstalled = false;
       try {
         await this.scheduler.installDailyLaunchAgent({ time: config.schedule.time });
+        scheduleInstalled = true;
         this._scheduleStatus = typeof this.scheduler.readDailyLaunchAgent === 'function'
           ? await this.scheduler.readDailyLaunchAgent()
           : null;
         config.schedule.enabled = Boolean(this._scheduleStatus?.enabled && this._scheduleStatus.verified);
+        if (!config.schedule.enabled && typeof this.scheduler.removeDailyLaunchAgent === 'function') {
+          await this.scheduler.removeDailyLaunchAgent();
+          scheduleInstalled = false;
+          this._scheduleStatus = await this._readScheduleStatus();
+        }
       } catch {
         // Keep the completed repository setup usable while accurately showing
         // that launchd could not be installed on this host.
+        if (scheduleInstalled && typeof this.scheduler.removeDailyLaunchAgent === 'function') {
+          await this.scheduler.removeDailyLaunchAgent().catch(() => undefined);
+        }
         config.schedule.enabled = false;
         this._scheduleStatus = { enabled: false, loaded: false, verified: false, time: config.schedule.time, detail: 'Daily schedule could not be verified.' };
       }

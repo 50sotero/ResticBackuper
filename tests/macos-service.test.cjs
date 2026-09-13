@@ -364,6 +364,40 @@ test('first-run setup leaves an unsafe recovery key for explicit user cleanup an
   await assert.rejects(() => fs.access(path.join(dataDir, 'credential.json')));
 });
 
+test('first-run setup removes an unverified LaunchAgent instead of persisting a misleading daily schedule', async () => {
+  const root = await tempDir('rewindle-unverified-schedule-');
+  const source = path.join(root, 'source');
+  const dataDir = path.join(root, 'Rewindle');
+  await fs.mkdir(source, { recursive: true });
+  const runner = fakeResticRunner({ root });
+  const ui = uiFixture(root, { sources: [source], repository: path.join(root, 'repository') });
+  const schedulerCalls = [];
+  const scheduler = {
+    async installDailyLaunchAgent(options) { schedulerCalls.push(['install', options]); },
+    async readDailyLaunchAgent() {
+      schedulerCalls.push(['read']);
+      return { enabled: false, loaded: false, verified: false, time: '02:00', detail: 'LaunchAgent is not loaded.' };
+    },
+    async removeDailyLaunchAgent() { schedulerCalls.push(['remove']); },
+  };
+  const service = new MacBackupService({
+    platform: 'darwin',
+    dataDir,
+    resticPath: path.join(root, 'restic'),
+    encryptString: (value) => Buffer.from(value),
+    decryptString: (value) => Buffer.from(value).toString('utf8'),
+    spawnProcess: runner,
+    scheduler,
+    ui,
+    enforceUnixPermissions: false,
+  });
+  await service.initialize();
+  await service._ensureConfigured();
+  assert.deepEqual(schedulerCalls.map(([name]) => name), ['install', 'read', 'remove']);
+  const config = JSON.parse(await fs.readFile(path.join(dataDir, 'config.json'), 'utf8'));
+  assert.equal(config.schedule.enabled, false);
+});
+
 test('setup rejects repository and source selections that overlap Rewindle data', async () => {
   const root = await tempDir('rewindle-overlap-');
   const dataDir = path.join(root, 'Rewindle');
