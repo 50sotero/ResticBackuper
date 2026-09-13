@@ -1158,6 +1158,28 @@ class MacBackupService extends EventEmitter {
     this._state = this._buildState(this._state?.page || 'Protection');
   }
 
+  _buildActions() {
+    const active = Boolean(this._state?.status?.active && this._state.status.key === 'active');
+    const configured = Boolean(this._config);
+    const actions = defaultActions();
+    actions.backupNow = normalizeAction(!active, configured ? 'Back up now' : 'Set up backup', configured ? 'Start an encrypted Restic backup.' : 'Choose a repository and folders to protect.');
+    actions.cancelBackup = normalizeAction(active, 'Cancel backup', active ? 'Ask Restic to stop the active backup.' : 'No backup is currently running.');
+    actions.togglePreview = normalizeAction(!active, 'Preview animations', active ? 'Wait for the active backup before previewing animations.' : 'Play the presentation animation without running a backup.');
+    actions.addSource = normalizeAction(configured && !active, 'Add folder', 'Choose another folder to protect.');
+    actions.removeSource = normalizeAction(configured && !active, 'Remove folder', 'Remove this folder from future backups.');
+    actions.editSchedule = normalizeAction(configured && !active, 'Edit schedule', 'Change the daily launchd schedule.');
+    actions.changeRepository = normalizeAction(false, 'Change repository', 'Changing repositories is not available in this release.', false);
+    actions.openRestore = normalizeAction(configured && !active, 'Open restore', 'Open the restore workflow.');
+    actions.checkReadiness = normalizeAction(configured && !active, 'Check readiness', 'Check repository and recovery readiness.');
+    actions.exportDiagnostics = normalizeAction(true, 'Export diagnostics', 'Save redacted diagnostic information.');
+    if (this._state?.preview) {
+      for (const command of ['backupNow', 'cancelBackup', 'addSource', 'removeSource', 'editSchedule', 'openRestore', 'checkReadiness']) {
+        actions[command] = { ...actions[command], enabled: false, help: 'Stop the animation preview before using this action.' };
+      }
+    }
+    return actions;
+  }
+
   _buildState(page) {
     const config = this._config;
     const latest = this._history[0] || null;
@@ -1170,7 +1192,7 @@ class MacBackupService extends EventEmitter {
       name: path.basename(source) || source,
       isCanary: false,
       exists: this._pathExistsSync(source),
-      canRemove: (config?.sources || []).length > 1,
+      canRemove: !active && !this._state?.preview && (config?.sources || []).length > 1,
       detail: this._pathExistsSync(source) ? 'Included in the next backup' : 'Folder not found',
     }));
     const status = this._state?.status || this._status(
@@ -1186,17 +1208,7 @@ class MacBackupService extends EventEmitter {
       },
     );
     const configured = Boolean(config);
-    const actions = defaultActions();
-    actions.backupNow = normalizeAction(!active, configured ? 'Back up now' : 'Set up backup', configured ? 'Start an encrypted Restic backup.' : 'Choose a repository and folders to protect.');
-    actions.cancelBackup = normalizeAction(Boolean(active), 'Cancel backup', active ? 'Ask Restic to stop the active backup.' : 'No backup is currently running.');
-    actions.addSource = normalizeAction(configured && !active, 'Add folder', 'Choose another folder to protect.');
-    actions.removeSource = normalizeAction(configured && !active, 'Remove folder', 'Remove this folder from future backups.');
-    actions.editSchedule = normalizeAction(configured && !active, 'Edit schedule', 'Change the daily launchd schedule.');
-    actions.changeRepository = normalizeAction(configured && !active, 'Change repository', 'Choose a different Restic repository.');
-    actions.changeRepository = normalizeAction(false, 'Change repository', 'Changing repositories is not available in this release.', false);
-    actions.openRestore = normalizeAction(configured && !active, 'Open restore', 'Open the restore workflow.');
-    actions.checkReadiness = normalizeAction(configured && !active, 'Check readiness', 'Check repository and recovery readiness.');
-    actions.exportDiagnostics = normalizeAction(true, 'Export diagnostics', 'Save redacted diagnostic information.');
+    const actions = this._buildActions();
     const state = {
       page: PAGE_NAMES.has(page) ? page : 'Protection',
       demo: false,
@@ -1266,6 +1278,11 @@ class MacBackupService extends EventEmitter {
 
   _setState(patch) {
     this._state = { ...this._state, ...patch, updated: isoNow() };
+    this._state.actions = this._buildActions();
+    this._state.sources = this._state.sources.map((source) => ({
+      ...source,
+      canRemove: !this._state.status.active && !this._state.preview && this._state.sources.length > 1 && !source.isCanary,
+    }));
     this._emitState();
   }
 

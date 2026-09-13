@@ -477,14 +477,22 @@ test('backup cancellation sends SIGINT to the active Restic child and records a 
   const { service } = await makeConfiguredService(root, runner);
   await service.execute('togglePreview');
   assert.equal(service.getState().preview, true);
+  assert.equal(service.getState().actions.backupNow.enabled, false);
+  assert.equal(service.getState().actions.togglePreview.enabled, true);
   const running = service.execute('backupNow');
   for (let i = 0; i < 30 && !runner.calls.some((call) => call.args[2] === 'backup'); i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
   assert.ok(runner.calls.some((call) => call.args[2] === 'backup'));
   assert.equal(service.getState().preview, false, 'a real backup must replace the presentation preview');
+  assert.equal(service.getState().actions.cancelBackup.enabled, true, 'cancellation must become available without a refresh');
+  assert.equal(service.getState().actions.backupNow.enabled, false);
+  assert.equal(service.getState().actions.addSource.enabled, false);
+  assert.equal(service.getState().actions.togglePreview.enabled, false);
   await service.execute('cancelBackup');
   const state = await running;
   assert.equal(state.status.cancelled, true);
   assert.equal(state.history[0].result, 'Cancelled');
+  assert.equal(state.actions.backupNow.enabled, true);
+  assert.equal(state.actions.cancelBackup.enabled, false);
 });
 
 test('restore rejects non-empty and overlapping destinations before invoking Restic', async () => {
