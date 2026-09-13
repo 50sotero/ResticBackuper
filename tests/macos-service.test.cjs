@@ -462,7 +462,7 @@ test('restore rejects non-empty and overlapping destinations before invoking Res
   const linkedDestination = path.join(root, 'source-link');
   const linked = await fs.symlink(source, linkedDestination, 'dir').then(() => true).catch(() => false);
   if (linked) {
-    await assert.rejects(() => service.execute('openRestore', { snapshotId: '12345678', destination: linkedDestination }), /overlap/);
+    await assert.rejects(() => service.execute('openRestore', { snapshotId: '12345678', destination: linkedDestination }), /overlap|symbolic link/);
   }
   assert.equal(runner.calls.some((call) => call.args[2] === 'restore'), false);
 });

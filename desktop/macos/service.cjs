@@ -783,6 +783,15 @@ class MacBackupService extends EventEmitter {
     if (!validatedRecoveryPath.ok) {
       throw new Error('The recovery key was saved at an unsafe location. Remove that file manually and run setup again; Rewindle did not delete it.');
     }
+    if (this.enforceUnixPermissions) {
+      await fs.chmod(validatedRecoveryPath.path, 0o600).catch(() => {
+        throw new Error('Rewindle could not set owner-only permissions on the recovery key. Remove that file manually and run setup again.');
+      });
+      const permissionCheck = await this._validateRecoveryKeyPath(validatedRecoveryPath.path, { repository, sources });
+      if (!permissionCheck.ok) {
+        throw new Error('The recovery key permissions could not be verified. Remove that file manually and run setup again.');
+      }
+    }
     if (!this.encryptString) throw new Error('Electron safeStorage encryption is unavailable.');
     const encrypted = await this.encryptString(password);
     const canaryPath = path.join(this.dataDir, CANARY_DIR, `rewindle-${randomId()}.txt`);
@@ -932,6 +941,8 @@ class MacBackupService extends EventEmitter {
   async _validateRestoreDestination(destination) {
     if (!isAbsolutePath(destination)) throw new Error('Restore destination must be a full macOS path.');
     if (path.resolve(destination) === path.parse(destination).root) throw new Error('Restore destination cannot be the filesystem root.');
+    const destinationLink = await fs.lstat(destination).catch(() => null);
+    if (destinationLink?.isSymbolicLink()) throw new Error('Restore destination cannot be a symbolic link.');
     const canonicalDestination = await this._canonicalPath(destination);
     if (this._config?.repository && pathsOverlap(canonicalDestination, await this._canonicalPath(this._config.repository))) throw new Error('Restore destination cannot overlap the Restic repository.');
     for (const source of this._config?.sources || []) {
@@ -943,6 +954,8 @@ class MacBackupService extends EventEmitter {
     if (!stat) await fs.mkdir(destination, { recursive: true, mode: 0o700 });
     // Re-read after creating a new target so a race that populated the folder
     // between validation and creation cannot turn into an implicit merge.
+    const createdDestinationLink = await fs.lstat(destination).catch(() => null);
+    if (createdDestinationLink?.isSymbolicLink()) throw new Error('Restore destination cannot be a symbolic link.');
     if ((await fs.readdir(destination)).length) throw new Error('Restore destination must be empty.');
   }
 
