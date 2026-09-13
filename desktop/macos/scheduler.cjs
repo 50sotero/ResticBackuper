@@ -139,14 +139,14 @@ class MacLaunchAgentScheduler {
     const tempPath = `${this.plistPath}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
     await fs.writeFile(tempPath, plist, { encoding: 'utf8', mode: 0o600 });
     await fs.rename(tempPath, this.plistPath);
-    await this._launchctl(['bootout', userDomainTarget(this.uid), this.label], true);
+    await this._launchctl(['bootout', `${userDomainTarget(this.uid)}/${this.label}`], true);
     const result = await this._launchctl(['bootstrap', userDomainTarget(this.uid), this.plistPath], false);
     if (result.code !== 0) throw new Error(result.stderr.trim() || 'launchd could not install the Proofhold schedule.');
     return { path: this.plistPath, label: this.label, time: normalizedTime };
   }
 
   async removeDailyLaunchAgent() {
-    await this._launchctl(['bootout', userDomainTarget(this.uid), this.label], true);
+    await this._launchctl(['bootout', `${userDomainTarget(this.uid)}/${this.label}`], true);
     await fs.rm(this.plistPath, { force: true });
     return { removed: true, path: this.plistPath };
   }
