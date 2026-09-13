@@ -1,14 +1,14 @@
 'use strict';
 
-/** User LaunchAgent scheduling for Proofhold's daily backup. */
+/** User LaunchAgent scheduling for Rewindle's daily backup. */
 
-const { promises: fs } = require('node:fs');
+const { promises: fs, constants: fsConstants } = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const childProcess = require('node:child_process');
 const crypto = require('node:crypto');
 
-const LABEL = 'com.proofhold.backup';
+const LABEL = 'com.rewindle.backup';
 
 function validateScheduleTime(value) {
   const text = String(value || '').trim();
@@ -31,8 +31,17 @@ function plistEscape(value) {
     .replaceAll("'", '&apos;');
 }
 
+function plistUnescape(value) {
+  return String(value)
+    .replaceAll('&quot;', '"')
+    .replaceAll('&apos;', "'")
+    .replaceAll('&gt;', '>')
+    .replaceAll('&lt;', '<')
+    .replaceAll('&amp;', '&');
+}
+
 function buildLaunchAgentPlist({ executablePath, time, label = LABEL, workingDirectory = '' }) {
-  if (!executablePath || !path.isAbsolute(executablePath)) throw new Error('A full Proofhold executable path is required.');
+  if (!executablePath || !path.isAbsolute(executablePath)) throw new Error('A full Rewindle executable path is required.');
   const normalizedTime = validateScheduleTime(time);
   const [hour, minute] = normalizedTime.split(':').map(Number);
   const entries = [
@@ -85,6 +94,11 @@ function spawnDefault(spawnProcess, executable, args, options) {
 
 function waitForChild(child) {
   let stderr = '';
+  let stdout = '';
+  if (child.stdout?.on) child.stdout.on('data', (chunk) => {
+    stdout += String(chunk || '');
+    if (stdout.length > 20000) stdout = stdout.slice(-20000);
+  });
   if (child.stderr?.on) child.stderr.on('data', (chunk) => {
     stderr += String(chunk || '');
     if (stderr.length > 10000) stderr = stderr.slice(-10000);
@@ -94,7 +108,7 @@ function waitForChild(child) {
     const done = (result) => {
       if (settled) return;
       settled = true;
-      resolve({ ...result, stderr });
+      resolve({ ...result, stdout, stderr });
     };
     child.once?.('error', (error) => {
       if (settled) return;
@@ -110,7 +124,7 @@ class MacLaunchAgentScheduler {
   constructor(options = {}) {
     this.platform = options.platform || process.platform;
     if (this.platform !== 'darwin') {
-      const error = new Error('Proofhold launchd scheduling requires macOS.');
+      const error = new Error('Rewindle launchd scheduling requires macOS.');
       error.code = 'UNSUPPORTED_PLATFORM';
       throw error;
     }
@@ -128,7 +142,12 @@ class MacLaunchAgentScheduler {
 
   async installDailyLaunchAgent({ time }) {
     const normalizedTime = validateScheduleTime(time);
-    if (!this.executablePath || !path.isAbsolute(this.executablePath)) throw new Error('Proofhold executable path is not configured.');
+    if (!this.executablePath || !path.isAbsolute(this.executablePath)) throw new Error('Rewindle executable path is not configured.');
+    try {
+      await fs.access(this.executablePath, fsConstants.X_OK);
+    } catch {
+      throw new Error('Rewindle executable is missing or not executable.');
+    }
     const plist = buildLaunchAgentPlist({
       executablePath: this.executablePath,
       time: normalizedTime,
@@ -149,7 +168,7 @@ class MacLaunchAgentScheduler {
       } else {
         await fs.rm(this.plistPath, { force: true });
       }
-      throw new Error(result.stderr.trim() || 'launchd could not install the Proofhold schedule.');
+      throw new Error(result.stderr.trim() || 'launchd could not install the Rewindle schedule.');
     }
     return { path: this.plistPath, label: this.label, time: normalizedTime };
   }
@@ -161,15 +180,36 @@ class MacLaunchAgentScheduler {
   }
 
   async readDailyLaunchAgent() {
+    let text;
     try {
-      const text = await fs.readFile(this.plistPath, 'utf8');
-      const hour = text.match(/<key>Hour<\/key>\s*<integer>(\d+)<\/integer>/)?.[1];
-      const minute = text.match(/<key>Minute<\/key>\s*<integer>(\d+)<\/integer>/)?.[1];
-      if (hour === undefined || minute === undefined) return null;
-      return { enabled: true, time: `${String(Number(hour)).padStart(2, '0')}:${String(Number(minute)).padStart(2, '0')}`, path: this.plistPath };
+      text = await fs.readFile(this.plistPath, 'utf8');
     } catch {
-      return null;
+      return { enabled: false, loaded: false, verified: false, time: null, path: this.plistPath, detail: 'LaunchAgent plist is missing.' };
     }
+    const hour = text.match(/<key>Hour<\/key>\s*<integer>(\d+)<\/integer>/)?.[1];
+    const minute = text.match(/<key>Minute<\/key>\s*<integer>(\d+)<\/integer>/)?.[1];
+    const executable = text.match(/<key>ProgramArguments<\/key>\s*<array>\s*<string>([\s\S]*?)<\/string>/)?.[1];
+    const time = hour === undefined || minute === undefined ? null : `${String(Number(hour)).padStart(2, '0')}:${String(Number(minute)).padStart(2, '0')}`;
+    const plistExecutable = executable ? plistUnescape(executable) : '';
+    let executableOk = false;
+    try {
+      await fs.access(this.executablePath, fsConstants.X_OK);
+      executableOk = true;
+    } catch {
+      executableOk = false;
+    }
+    const printed = await this._launchctl(['print', `${userDomainTarget(this.uid)}/${this.label}`], true);
+    const loaded = printed.code === 0;
+    const verified = Boolean(loaded && executableOk && plistExecutable === this.executablePath && time);
+    return {
+      enabled: verified,
+      loaded,
+      verified,
+      executableOk,
+      time,
+      path: this.plistPath,
+      detail: verified ? 'User LaunchAgent is loaded and points to the executable.' : 'LaunchAgent is not loaded or its executable could not be verified.',
+    };
   }
 
   async _launchctl(args, ignoreFailure) {

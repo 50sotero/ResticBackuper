@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * Proofhold's macOS backup service.
+ * Rewindle's macOS backup service.
  *
  * The service deliberately owns no UI toolkit.  The Electron preload injects
  * safeStorage wrappers, a small dialog API, and (in production) Electron's
@@ -30,6 +30,9 @@ const STATUS_FILE = 'status.json';
 const CANARY_DIR = 'canary';
 const RUNTIME_DIR = '.runtime';
 const MAX_HISTORY = 100;
+const RESTIC_COMMANDS = new Set(['init', 'backup', 'check', 'restore', 'snapshots', 'ls']);
+const PASSWORD_ENV_KEYS = ['RESTIC_PASSWORD', 'RESTIC_PASSWORD_FILE', 'RESTIC_PASSWORD_COMMAND'];
+const RECOVERY_KEY_NAME = 'Rewindle-RecoveryKey.txt';
 
 const PAGE_NAMES = new Set(['Protection', 'Activity', 'Restore', 'Settings']);
 const COMMAND_NAMES = new Set([
@@ -52,7 +55,7 @@ class UserCancelledError extends Error {
 
 class UnsupportedPlatformError extends Error {
   constructor() {
-    super('Proofhold macOS backup service requires macOS.');
+    super('Rewindle macOS backup service requires macOS.');
     this.name = 'UnsupportedPlatformError';
     this.code = 'UNSUPPORTED_PLATFORM';
   }
@@ -138,6 +141,10 @@ function sameOrChild(candidate, parent) {
 
 function pathsOverlap(left, right) {
   return sameOrChild(left, right) || sameOrChild(right, left);
+}
+
+function isSha256(value) {
+  return typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value);
 }
 
 function normalizeSelection(value, multiple) {
@@ -252,12 +259,13 @@ class MacBackupService extends EventEmitter {
     this.platform = options.platform || process.platform;
     if (this.platform !== 'darwin') throw new UnsupportedPlatformError();
 
-    this.dataDir = normalizePath(options.dataDir || path.join(os.homedir(), 'Library', 'Application Support', 'Proofhold'));
+    this.dataDir = normalizePath(options.dataDir || path.join(os.homedir(), 'Library', 'Application Support', 'Rewindle'));
     this.resticPath = normalizePath(options.resticPath || path.join(options.appBundlePath || '', 'Contents', 'Resources', 'restic'));
     this.appBundlePath = options.appBundlePath || '';
     this.appExecutablePath = options.appExecutablePath || options.launchExecutable || '';
     this.encryptString = typeof options.encryptString === 'function' ? options.encryptString : null;
     this.decryptString = typeof options.decryptString === 'function' ? options.decryptString : null;
+    this.enforceUnixPermissions = options.enforceUnixPermissions === undefined ? process.platform === 'darwin' : Boolean(options.enforceUnixPermissions);
     this.spawnProcess = options.spawnProcess || childProcess.spawn;
     this.ui = options.ui || {};
     this.scheduler = options.scheduler || null;
@@ -286,6 +294,7 @@ class MacBackupService extends EventEmitter {
     this._cancelRequested = false;
     this._operation = Promise.resolve();
     this._writeQueue = Promise.resolve();
+    this._scheduleStatus = null;
     this._initialized = false;
   }
 
@@ -293,6 +302,7 @@ class MacBackupService extends EventEmitter {
     await this._ensureDataDir();
     this._config = await this._readConfig();
     this._history = await this._readHistory();
+    this._scheduleStatus = await this._readScheduleStatus();
     const persisted = await this._readJson(STATUS_FILE, null);
     this._state = this._buildState(persisted && persisted.page ? persisted.page : 'Protection');
     this._initialized = true;
@@ -340,6 +350,7 @@ class MacBackupService extends EventEmitter {
     if (!this._initialized) await this.initialize();
     this._config = await this._readConfig();
     this._history = await this._readHistory();
+    this._scheduleStatus = await this._readScheduleStatus();
     this._state = this._buildState(this._state?.page || 'Protection');
     this._state.dataError = undefined;
     this._emitState();
@@ -351,6 +362,7 @@ class MacBackupService extends EventEmitter {
     await this._ensureConfigured();
     if (!this._config || !this._config.sources.length) throw new Error('Choose at least one folder before starting a backup.');
     await this._validateConfiguredPaths();
+    await this._validateCanary();
     const password = await this._loadPassword();
     const started = Date.now();
     const runId = randomId();
@@ -365,7 +377,7 @@ class MacBackupService extends EventEmitter {
     let passwordFile = null;
     try {
       passwordFile = await this._createPasswordFile(password);
-      const args = ['-r', this._config.repository, 'backup', '--json', '--tag', 'proofhold', ...this._config.sources];
+      const args = ['-r', this._config.repository, 'backup', '--json', '--tag', 'rewindle', ...this._config.sources];
       if (this._config.canaryPath) args.push(this._config.canaryPath);
       const events = [];
       result = await this._runRestic(args, {
@@ -382,12 +394,12 @@ class MacBackupService extends EventEmitter {
       if (!snapshotId) throw new Error('Restic completed without returning a snapshot ID.');
 
       this._setState({
-        status: this._status('active', 'Verifying backup', 'Checking the repository and restoring the canary file.', {
+        status: this._status('active', 'Verifying backup', 'Checking repository structure, a 5% data subset, and restoring the canary file.', {
           runId, phaseIndex: 2, phaseLabel: 'Verifying', progress: 0.75,
         }),
       });
       let checkSummary = null;
-      const checkResult = await this._runRestic(['-r', this._config.repository, 'check', '--json'], {
+      const checkResult = await this._runRestic(['-r', this._config.repository, 'check', '--json', '--read-data-subset=5%'], {
         passwordFile,
         onJson: (event) => {
           if (event.message_type === 'summary') checkSummary = event;
@@ -508,8 +520,14 @@ class MacBackupService extends EventEmitter {
       })));
     }
     const previousConfig = this._config;
-    await this.scheduler.installDailyLaunchAgent({ time });
     try {
+      await this.scheduler.installDailyLaunchAgent({ time });
+      this._scheduleStatus = typeof this.scheduler.readDailyLaunchAgent === 'function'
+        ? await this.scheduler.readDailyLaunchAgent()
+        : null;
+      if (!this._scheduleStatus?.enabled || !this._scheduleStatus.verified) {
+        throw new Error('The daily LaunchAgent could not be verified after installation.');
+      }
       this._config = { ...previousConfig, schedule: { enabled: true, time }, updated: isoNow() };
       await this._writeConfig(this._config);
     } catch (error) {
@@ -523,6 +541,7 @@ class MacBackupService extends EventEmitter {
       } catch {
         // Keep the old in-memory configuration and surface the write failure.
       }
+      this._scheduleStatus = await this._readScheduleStatus();
       throw error;
     }
     this._state = this._buildState(this._state.page);
@@ -531,54 +550,47 @@ class MacBackupService extends EventEmitter {
   }
 
   async changeRepository() {
-    await this._ensureConfigured(false);
-    const selected = normalizeSelection(await this._callUi('chooseDirectories', {
-      title: 'Choose the Restic repository folder',
-      multiple: false,
-    }), false);
-    if (!selected.length) throw new UserCancelledError();
-    const repository = normalizePath(selected[0]);
-    await this._validateRepositorySelection(repository);
-    const confirmed = await this._callUi('confirm', {
-      title: 'Use this repository?',
-      message: safeDisplayPath(repository),
-      detail: 'Proofhold will use this exact folder for future backups. Existing snapshots are never deleted automatically.',
-    });
-    if (!confirmed) throw new UserCancelledError();
-    this._config = { ...this._config, repository, updated: isoNow() };
-    await this._writeConfig(this._config);
-    this._state = this._buildState(this._state.page);
-    this._emitState();
-    return this.getState();
+    return this._unsupported('Changing repositories is not available in this release. Choose a new plan only after exporting your recovery key.');
   }
 
   async checkReadiness() {
     const checks = [];
     checks.push({ label: 'Repository configured', ok: Boolean(this._config?.repository) });
-    checks.push({ label: 'Encrypted credential available', ok: Boolean(await this._readCredential()) });
-    if (this._config?.repository && await this._pathExists(this._config.repository)) {
+    const credential = await this._readCredential();
+    checks.push({ label: 'Encrypted credential available', ok: Boolean(credential) });
+    let canaryOkay = false;
+    try {
+      await this._validateCanary();
+      canaryOkay = true;
+    } catch {
+      canaryOkay = false;
+    }
+    checks.push({ label: 'Canary file and hash valid', ok: canaryOkay });
+    const repositoryStat = this._config?.repository ? await fs.stat(this._config.repository).catch(() => null) : null;
+    const repositoryLink = this._config?.repository ? await fs.lstat(this._config.repository).catch(() => null) : null;
+    if (credential && repositoryStat?.isDirectory() && !repositoryLink?.isSymbolicLink()) {
       try {
         const password = await this._loadPassword(false);
         const passwordFile = await this._createPasswordFile(password);
         try {
           const result = await this._runRestic(['-r', this._config.repository, 'snapshots', '--json'], { passwordFile });
-          checks.push({ label: 'Repository can be opened', ok: result.code === 0 });
+          checks.push({ label: 'Repository responds to snapshot listing', ok: result.code === 0 });
         } finally {
           await this._removeRuntimeFile(passwordFile);
         }
       } catch {
-        checks.push({ label: 'Repository can be opened', ok: false });
+        checks.push({ label: 'Repository responds to snapshot listing', ok: false });
       }
     } else {
-      checks.push({ label: 'Repository can be opened', ok: false });
+      checks.push({ label: 'Repository responds to snapshot listing', ok: false });
     }
     const ready = checks.every((check) => check.ok);
     this._state = this._buildState('Restore');
     this._state.recovery = {
-      title: ready ? 'Ready for recovery' : 'Recovery needs attention',
-      detail: ready ? 'The repository and encrypted credential are available.' : checks.filter((check) => !check.ok).map((check) => check.label).join(' · '),
+      title: ready ? 'Readiness checks passed' : 'Recovery needs attention',
+      detail: ready ? 'Encrypted credential, canary hash, and repository snapshot listing passed. This read-only check does not run a restore drill.' : checks.filter((check) => !check.ok).map((check) => check.label).join(' · '),
       repairNeeded: !ready,
-      repairMessage: ready ? '' : 'Resolve the checks above before relying on this repository for recovery.',
+      repairMessage: ready ? 'Run an independent restore drill before relying on this repository for recovery.' : 'Resolve the checks above before relying on this repository for recovery.',
       repairState: ready ? 'ready' : 'attention',
       repairBusy: false,
       repairPercent: null,
@@ -688,7 +700,7 @@ class MacBackupService extends EventEmitter {
 
   async exportDiagnostics() {
     const diagnostics = {
-      product: 'Proofhold',
+      product: 'Rewindle',
       version: '0.2.0-alpha.1',
       platform: 'macOS',
       serviceVersion: SERVICE_VERSION,
@@ -718,8 +730,8 @@ class MacBackupService extends EventEmitter {
     };
     const text = `${JSON.stringify(diagnostics, null, 2)}\n`;
     const saved = await this._callUi('saveText', {
-      title: 'Save Proofhold diagnostics',
-      defaultPath: path.join(os.homedir(), 'Desktop', 'Proofhold-diagnostics.json'),
+      title: 'Save Rewindle diagnostics',
+      defaultPath: path.join(os.homedir(), 'Desktop', 'Rewindle-diagnostics.json'),
       text,
     });
     if (!saved) throw new UserCancelledError();
@@ -728,7 +740,7 @@ class MacBackupService extends EventEmitter {
 
   async _ensureConfigured(interactive = true) {
     if (this._config) return this._config;
-    if (!interactive) throw new Error('Complete Proofhold setup before using this action.');
+    if (!interactive) throw new Error('Complete Rewindle setup before using this action.');
     const repoSelection = normalizeSelection(await this._callUi('chooseDirectories', {
       title: 'Choose the Restic repository folder',
       multiple: false,
@@ -744,7 +756,7 @@ class MacBackupService extends EventEmitter {
     await this._validateRepositorySelection(repository, sources);
     const password = randomPassword();
     const recoveryText = [
-      'Proofhold recovery key',
+      'Rewindle recovery key',
       '=======================',
       '',
       'Keep this key offline. It unlocks the encrypted Restic repository.',
@@ -754,15 +766,26 @@ class MacBackupService extends EventEmitter {
       '',
       `Created: ${isoNow()}`,
     ].join('\n');
+    const blockedRecoveryPaths = [repository, this.dataDir, ...sources];
     const recoveryPath = await this._callUi('saveText', {
-      title: 'Save your Proofhold recovery key',
-      defaultPath: path.join(os.homedir(), 'Desktop', 'Proofhold-RecoveryKey.txt'),
+      title: 'Save your Rewindle recovery key',
+      defaultPath: path.join(os.homedir(), 'Desktop', RECOVERY_KEY_NAME),
       text: `${recoveryText}\n`,
+      blockedPaths: blockedRecoveryPaths,
+      validatePath: (candidate) => this._validateRecoveryKeyPath(candidate, {
+        requireExisting: false,
+        repository,
+        sources,
+      }),
     });
     if (!recoveryPath) throw new UserCancelledError('Save the recovery key before initializing the repository.');
+    const validatedRecoveryPath = await this._validateRecoveryKeyPath(recoveryPath, { repository, sources });
+    if (!validatedRecoveryPath.ok) {
+      throw new Error('The recovery key was saved at an unsafe location. Remove that file manually and run setup again; Rewindle did not delete it.');
+    }
     if (!this.encryptString) throw new Error('Electron safeStorage encryption is unavailable.');
     const encrypted = await this.encryptString(password);
-    const canaryPath = path.join(this.dataDir, CANARY_DIR, `proofhold-${randomId()}.txt`);
+    const canaryPath = path.join(this.dataDir, CANARY_DIR, `rewindle-${randomId()}.txt`);
     await fs.mkdir(path.dirname(canaryPath), { recursive: true, mode: 0o700 });
     const canaryContent = crypto.randomBytes(32).toString('hex');
     await fs.writeFile(canaryPath, canaryContent, { mode: 0o600 });
@@ -774,7 +797,7 @@ class MacBackupService extends EventEmitter {
       canaryPath,
       canaryHash,
       schedule: { enabled: false, time: '02:00' },
-      recoveryKeyPath: typeof recoveryPath === 'string' ? normalizePath(recoveryPath) : '',
+      recoveryKeyPath: validatedRecoveryPath.path,
       created: isoNow(),
       updated: isoNow(),
     };
@@ -795,11 +818,15 @@ class MacBackupService extends EventEmitter {
     if (this.scheduler && typeof this.scheduler.installDailyLaunchAgent === 'function') {
       try {
         await this.scheduler.installDailyLaunchAgent({ time: config.schedule.time });
-        config.schedule.enabled = true;
+        this._scheduleStatus = typeof this.scheduler.readDailyLaunchAgent === 'function'
+          ? await this.scheduler.readDailyLaunchAgent()
+          : null;
+        config.schedule.enabled = Boolean(this._scheduleStatus?.enabled && this._scheduleStatus.verified);
       } catch {
         // Keep the completed repository setup usable while accurately showing
         // that launchd could not be installed on this host.
         config.schedule.enabled = false;
+        this._scheduleStatus = { enabled: false, loaded: false, verified: false, time: config.schedule.time, detail: 'Daily schedule could not be verified.' };
       }
     }
     this._config = config;
@@ -814,10 +841,14 @@ class MacBackupService extends EventEmitter {
     const canonicalSources = new Map();
     for (const source of sources) canonicalSources.set(source, await this._canonicalPath(source));
     const canonicalRepository = repository ? await this._canonicalPath(repository) : '';
+    const canonicalDataDir = await this._canonicalPath(this.dataDir);
     for (const source of sources) {
       const stat = await fs.stat(source).catch(() => null);
       if (!stat || !stat.isDirectory()) throw new Error(`Protected folder does not exist or is not a directory: ${safeDisplayPath(source)}`);
+      const link = await fs.lstat(source).catch(() => null);
+      if (link?.isSymbolicLink()) throw new Error(`Protected folder is a symbolic link. Choose its real folder: ${safeDisplayPath(source)}`);
       if (repository && pathsOverlap(canonicalSources.get(source), canonicalRepository)) throw new Error('A protected folder cannot contain the Restic repository.');
+      if (pathsOverlap(canonicalSources.get(source), canonicalDataDir)) throw new Error('Protected folders cannot overlap Rewindle application data.');
     }
     for (let i = 0; i < sources.length; i += 1) {
       for (let j = i + 1; j < sources.length; j += 1) {
@@ -830,26 +861,72 @@ class MacBackupService extends EventEmitter {
   async _validateRepositorySelection(repository, sources = this._config?.sources || []) {
     const stat = await fs.stat(repository).catch(() => null);
     if (stat && !stat.isDirectory()) throw new Error('The repository path must be a folder.');
+    const link = await fs.lstat(repository).catch(() => null);
+    if (link?.isSymbolicLink()) throw new Error('The repository path is a symbolic link. Choose its real folder.');
     const canonicalRepository = await this._canonicalPath(repository);
+    if (pathsOverlap(canonicalRepository, await this._canonicalPath(this.dataDir))) {
+      throw new Error('The Restic repository cannot overlap Rewindle application data.');
+    }
     for (const source of sources) {
       if (pathsOverlap(canonicalRepository, await this._canonicalPath(source))) throw new Error('The Restic repository cannot overlap a protected folder.');
     }
     if (stat) {
       const entries = await fs.readdir(repository).catch(() => []);
-      if (entries.length) {
-        const confirmed = await this._callUi('confirm', {
-          title: 'Use a non-empty repository folder?',
-          message: safeDisplayPath(repository),
-          detail: 'Proofhold will inspect this existing repository. It will not delete or prune any data.',
-        });
-        if (!confirmed) throw new UserCancelledError();
-      }
+      if (entries.length) throw new Error('New Rewindle setup requires an empty repository folder. Choose an empty folder or create a new one.');
     }
   }
 
   async _validateConfiguredPaths() {
     await this._validateSourceSelection(this._config.sources, this._config.repository);
-    if (!(await this._pathExists(this._config.repository))) throw new Error('The configured Restic repository no longer exists.');
+    const repositoryStat = await fs.stat(this._config.repository).catch(() => null);
+    if (!repositoryStat || !repositoryStat.isDirectory()) throw new Error('The configured Restic repository no longer exists.');
+    const repositoryLink = await fs.lstat(this._config.repository).catch(() => null);
+    if (repositoryLink?.isSymbolicLink()) throw new Error('The configured Restic repository is a symbolic link. Choose its real folder.');
+    if (pathsOverlap(await this._canonicalPath(this._config.repository), await this._canonicalPath(this.dataDir))) {
+      throw new Error('The configured Restic repository cannot overlap Rewindle application data.');
+    }
+  }
+
+  async _validateCanary() {
+    const canaryPath = this._config?.canaryPath;
+    if (!isAbsolutePath(canaryPath) || !isSha256(this._config?.canaryHash)) {
+      throw new Error('The backup canary is missing or invalid. Run setup again before starting a backup.');
+    }
+    const canaryLink = await fs.lstat(canaryPath).catch(() => null);
+    const canaryStat = await fs.stat(canaryPath).catch(() => null);
+    if (!canaryStat || !canaryStat.isFile() || canaryLink?.isSymbolicLink()) {
+      throw new Error('The backup canary file is missing or is not a regular file.');
+    }
+    const canonicalCanary = await this._canonicalPath(canaryPath);
+    if (!sameOrChild(canonicalCanary, await this._canonicalPath(path.join(this.dataDir, CANARY_DIR)))) {
+      throw new Error('The backup canary must remain inside Rewindle application data.');
+    }
+    const actualHash = await this._sha256(canaryPath);
+    if (actualHash.toLowerCase() !== this._config.canaryHash.toLowerCase()) {
+      throw new Error('The backup canary hash has changed. Restore the original canary or run setup again.');
+    }
+    return true;
+  }
+
+  async _validateRecoveryKeyPath(candidate, { requireExisting = true, repository, sources } = {}) {
+    if (!isAbsolutePath(candidate)) return { ok: false, message: 'Choose an absolute recovery-key path.' };
+    const target = normalizePath(candidate);
+    const blocked = [repository || this._config?.repository, this.dataDir, ...(sources || this._config?.sources || [])].filter(Boolean);
+    const canonicalTarget = await this._canonicalPath(target);
+    for (const blockedPath of blocked) {
+      if (pathsOverlap(canonicalTarget, await this._canonicalPath(blockedPath))) {
+        return { ok: false, message: 'Choose a recovery-key location outside the repository, Rewindle data, and protected folders.' };
+      }
+    }
+    const link = await fs.lstat(target).catch(() => null);
+    if (requireExisting) {
+      const stat = await fs.stat(target).catch(() => null);
+      if (!stat || !stat.isFile() || link?.isSymbolicLink()) return { ok: false, message: 'The recovery key must be an ordinary file.' };
+      if (this.enforceUnixPermissions && (stat.mode & 0o777) !== 0o600) return { ok: false, message: 'The recovery key must have owner-only permissions (mode 600).' };
+    } else if (link?.isSymbolicLink()) {
+      return { ok: false, message: 'Choose a recovery-key path that is not a symbolic link.' };
+    }
+    return { ok: true, path: target };
   }
 
   async _validateRestoreDestination(destination) {
@@ -870,14 +947,27 @@ class MacBackupService extends EventEmitter {
   }
 
   async _verifyCanary(snapshotId, passwordFile) {
-    if (!this._config?.canaryPath || !this._config.canaryHash) return;
+    await this._validateCanary();
     const restoreRoot = await fs.mkdtemp(path.join(this.dataDir, 'canary-verify-'));
     try {
-      const result = await this._runRestic(['-r', this._config.repository, 'restore', snapshotId, '--target', restoreRoot, '--json', '--verify'], { passwordFile });
+      const result = await this._runRestic([
+        '-r', this._config.repository,
+        'restore',
+        snapshotId,
+        '--target',
+        restoreRoot,
+        '--json',
+        '--verify',
+        '--include',
+        this._config.canaryPath,
+      ], { passwordFile });
       if (result.code !== 0) throw new Error(result.stderr.trim() || 'Restic could not restore the canary file.');
-      const name = path.basename(this._config.canaryPath);
-      const candidate = await this._findFile(restoreRoot, name);
-      if (!candidate) throw new Error('The canary file was not present in the verified snapshot.');
+      const relativeCanaryPath = path.relative(path.parse(this._config.canaryPath).root, this._config.canaryPath);
+      const candidate = path.join(restoreRoot, relativeCanaryPath);
+      const candidateStat = await fs.stat(candidate).catch(() => null);
+      if (!candidateStat || !candidateStat.isFile()) throw new Error('The exact canary file was not present in the verified snapshot.');
+      const candidateLink = await fs.lstat(candidate).catch(() => null);
+      if (candidateLink?.isSymbolicLink()) throw new Error('The restored canary path was a symbolic link.');
       const digest = await this._sha256(candidate);
       if (digest !== this._config.canaryHash) throw new Error('The restored canary hash did not match.');
     } finally {
@@ -934,7 +1024,11 @@ class MacBackupService extends EventEmitter {
 
   async _runRestic(args, options = {}) {
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw new TypeError('Restic arguments must be an array of strings.');
+    if (args[0] !== '-r' || !isAbsolutePath(args[1]) || !RESTIC_COMMANDS.has(args[2])) {
+      throw new Error('Unsupported or unsafe Restic command.');
+    }
     const env = { ...process.env };
+    for (const key of PASSWORD_ENV_KEYS) delete env[key];
     if (options.passwordFile) env.RESTIC_PASSWORD_FILE = options.passwordFile;
     const child = this.spawnProcess(this.resticPath, args, {
       cwd: this.dataDir,
@@ -1043,6 +1137,8 @@ class MacBackupService extends EventEmitter {
     const latest = this._history[0] || null;
     const active = this._state?.status?.active && this._state.status.key === 'active';
     const schedule = config?.schedule;
+    const scheduleStatus = this._scheduleStatus;
+    const scheduleVerified = Boolean(schedule?.enabled && scheduleStatus?.enabled && scheduleStatus?.verified);
     const sources = (config?.sources || []).map((source) => ({
       path: source,
       name: path.basename(source) || source,
@@ -1080,8 +1176,8 @@ class MacBackupService extends EventEmitter {
       demo: false,
       preview: Boolean(this._state?.preview),
       theme: THEMES.has(this._state?.theme) ? this._state.theme : 'System',
-      dark: process.env.PROOFHOLD_DARK_MODE === '1' || process.env.AppleInterfaceStyle === 'Dark',
-      reducedMotion: process.env.PROOFHOLD_REDUCED_MOTION === '1',
+      dark: process.env.REWINDLE_DARK_MODE === '1' || process.env.AppleInterfaceStyle === 'Dark',
+      reducedMotion: process.env.REWINDLE_REDUCED_MOTION === '1',
       highContrast: false,
       updated: isoNow(),
       subtitle: configured ? 'Encrypted daily protection for the folders you choose.' : 'Set up encrypted, verified backup in a few steps.',
@@ -1092,9 +1188,9 @@ class MacBackupService extends EventEmitter {
       history: this._history.map((item) => ({ ...item })),
       selectedRunId: this._state?.selectedRunId || latest?.id || null,
       schedule: {
-        summary: schedule?.enabled ? `Daily at ${schedule.time}` : 'Schedule off',
-        nextRun: schedule?.enabled ? nextDailyRun(schedule.time) : '—',
-        detail: schedule?.enabled ? 'User LaunchAgent · runs when you are signed in' : 'Automatic backup is disabled',
+        summary: scheduleVerified ? `Daily at ${scheduleStatus.time}` : schedule?.enabled ? 'Schedule needs attention' : 'Schedule off',
+        nextRun: scheduleVerified ? nextDailyRun(scheduleStatus.time) : '—',
+        detail: scheduleVerified ? scheduleStatus.detail : scheduleStatus?.detail || 'Automatic backup is disabled',
       },
       repository: {
         path: config?.repository || 'Not configured',
@@ -1219,7 +1315,7 @@ class MacBackupService extends EventEmitter {
 
   async _callUi(name, payload) {
     const fn = this.ui && this.ui[name];
-    if (typeof fn !== 'function') throw new Error(`Proofhold needs the ${name} dialog bridge.`);
+    if (typeof fn !== 'function') throw new Error(`Rewindle needs the ${name} dialog bridge.`);
     return fn(payload);
   }
 
@@ -1228,6 +1324,41 @@ class MacBackupService extends EventEmitter {
     await fs.chmod(this.dataDir, 0o700).catch(() => undefined);
     await fs.mkdir(path.join(this.dataDir, RUNTIME_DIR), { recursive: true, mode: 0o700 });
     await fs.chmod(path.join(this.dataDir, RUNTIME_DIR), 0o700).catch(() => undefined);
+    await this._cleanupRuntimeFiles();
+  }
+
+  async _cleanupRuntimeFiles() {
+    const runtime = path.join(this.dataDir, RUNTIME_DIR);
+    const entries = await fs.readdir(runtime, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile() || !/^password-\d+-[a-f0-9]{24}$/.test(entry.name)) continue;
+      const match = entry.name.match(/^password-(\d+)-/);
+      const ownerPid = Number(match?.[1]);
+      if (!Number.isSafeInteger(ownerPid) || ownerPid <= 0 || ownerPid === process.pid) continue;
+      let active = true;
+      try {
+        process.kill(ownerPid, 0);
+      } catch (error) {
+        if (error && error.code === 'ESRCH') active = false;
+      }
+      if (!active) await fs.rm(path.join(runtime, entry.name), { force: true }).catch(() => undefined);
+    }
+  }
+
+  async _readScheduleStatus() {
+    const configuredTime = this._config?.schedule?.time || '02:00';
+    if (!this._config?.schedule?.enabled || !this.scheduler || typeof this.scheduler.readDailyLaunchAgent !== 'function') {
+      return { enabled: false, loaded: false, verified: false, time: configuredTime, detail: 'Automatic backup is not installed.' };
+    }
+    try {
+      const actual = await this.scheduler.readDailyLaunchAgent();
+      if (!actual || actual.enabled !== true) {
+        return { enabled: false, loaded: false, verified: false, time: configuredTime, detail: 'Daily schedule is configured but its LaunchAgent is not loaded.' };
+      }
+      return { enabled: true, loaded: Boolean(actual.loaded), verified: Boolean(actual.verified), time: actual.time || configuredTime, detail: actual.detail || 'User LaunchAgent · runs when you are signed in.' };
+    } catch {
+      return { enabled: false, loaded: false, verified: false, time: configuredTime, detail: 'Daily schedule could not be verified.' };
+    }
   }
 
   async _readConfig() {
