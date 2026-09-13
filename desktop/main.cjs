@@ -55,6 +55,16 @@ let scheduledConsumed = false;
 let quitRequested = false;
 const smokeDiagnostics = [];
 const activeModals = new Map();
+const PREVIEW_LOOP_MS = 16_000;
+const PREVIEW_ACTIVE_MS = 13_800;
+const PREVIEW_STAGES = [
+  { label: 'Reading protected folders', detail: 'Previewing the folders that would be read.' },
+  { label: 'Saving encrypted snapshot', detail: 'Previewing the encrypted point-in-time save.' },
+  { label: 'Checking repository', detail: 'Previewing the repository integrity check.' },
+  { label: 'Verifying restore canary', detail: 'Previewing the independent restore verification.' },
+];
+let previewStartedAt = 0;
+let stateHeartbeatDelay = 0;
 
 app.setName(APP_NAME);
 app.setAppUserModelId(APP_ID);
@@ -149,7 +159,74 @@ function applyPresentation(state) {
     animationSettings = null;
   }
   const reducedMotion = Boolean(state.reducedMotion || (animationSettings && animationSettings.shouldRenderRichAnimation === false));
-  return { ...state, theme, dark, reducedMotion };
+  const presentation = { ...state, theme, dark, reducedMotion };
+  if (!state.preview) {
+    // The preview clock is presentation-only.  Stopping the toggle returns
+    // the unmodified core state, including its real status and history.
+    previewStartedAt = 0;
+    return presentation;
+  }
+  if (!previewStartedAt) previewStartedAt = Date.now();
+  return { ...presentation, status: animationPreviewStatus(state.status), updated: new Date().toISOString() };
+}
+
+function animationPreviewStatus(source) {
+  const base = isObject(source) ? source : {};
+  const elapsed = (Date.now() - previewStartedAt) % PREVIEW_LOOP_MS;
+  const clearValues = {
+    runId: '',
+    files: '—',
+    bytes: '—',
+    speed: '—',
+    elapsed: '—',
+    errors: '0',
+    etaTitle: 'Preview timeline',
+  };
+  if (elapsed >= PREVIEW_ACTIVE_MS) {
+    return {
+      ...base,
+      ...clearValues,
+      key: 'preview-complete',
+      title: 'Animation preview complete',
+      detail: 'All protection stages are shown. No backup is running.',
+      badge: 'Preview complete',
+      active: false,
+      success: true,
+      failure: false,
+      cancelled: false,
+      phaseIndex: PREVIEW_STAGES.length - 1,
+      phaseLabel: 'Done',
+      progress: 1,
+      estimated: false,
+      eta: '—',
+      etaHint: '',
+    };
+  }
+  const stageDuration = PREVIEW_ACTIVE_MS / PREVIEW_STAGES.length;
+  const stageIndex = Math.min(PREVIEW_STAGES.length - 1, Math.floor(elapsed / stageDuration));
+  const stage = PREVIEW_STAGES[stageIndex];
+  const withinStage = elapsed - (stageIndex * stageDuration);
+  const progress = ((stageIndex + (withinStage / stageDuration)) / PREVIEW_STAGES.length);
+  const remainingSeconds = Math.max(0, Math.ceil((PREVIEW_ACTIVE_MS - elapsed) / 1000));
+  return {
+    ...base,
+    ...clearValues,
+    key: 'preview',
+    title: 'Animation preview',
+    detail: `${stage.detail} No backup is running.`,
+    badge: 'Preview',
+    active: true,
+    success: false,
+    failure: false,
+    cancelled: false,
+    phaseIndex: stageIndex,
+    phaseLabel: stage.label,
+    progress: Math.max(0, Math.min(1, Number(progress.toFixed(3)))),
+    estimated: false,
+    elapsed: `${Math.floor(elapsed / 1000)}s`,
+    eta: `${remainingSeconds}s`,
+    etaHint: 'Presentation only; no Restic process is running.',
+  };
 }
 
 function encryptString(value) {
@@ -443,6 +520,52 @@ async function confirm(options = {}) {
   return result.response === 1;
 }
 
+function runDetailValue(run, displayKey, rawKey) {
+  const display = run && run[displayKey];
+  if (typeof display === 'string' && display.trim()) return display.trim();
+  const raw = run && run[rawKey];
+  if (raw === undefined || raw === null || raw === '') return '';
+  return String(raw);
+}
+
+function formatRunDetails(run) {
+  const lines = [];
+  const fields = [
+    ['Date', runDetailValue(run, 'startedDisplay', 'started')],
+    ['Result', runDetailValue(run, 'result', 'result')],
+    ['Files', runDetailValue(run, 'filesDisplay', 'files')],
+    ['Duration', runDetailValue(run, 'durationDisplay', 'durationSeconds')],
+    ['Processed', runDetailValue(run, 'processedDisplay', 'processedBytes')],
+    ['Stored', runDetailValue(run, 'storedDisplay', 'storedBytes')],
+    ['Snapshot', runDetailValue(run, 'snapshot', 'snapshot') || 'Unavailable'],
+  ];
+  for (const [label, value] of fields) {
+    if (value) lines.push(`${label}: ${value}`);
+  }
+  return lines.join('\n');
+}
+
+async function showRunDetails(runId) {
+  const state = await currentState();
+  const history = Array.isArray(state.history) ? state.history : [];
+  const run = history.find((entry) => isObject(entry) && entry.id === runId);
+  if (!run) throw new Error('Unknown backup run.');
+
+  // Keep selection behavior in core, then show the fields already exposed in
+  // the redacted dashboard history.  No raw logs or synthetic run values are
+  // introduced by the native host.
+  const result = await service.execute('viewRunDetails', { runId });
+  const resultState = result && result.status ? result : result && result.state && result.state.status ? result.state : null;
+  const nextState = applyPresentation(resultState || await currentState());
+  postNativeMessage({ type: 'state', state: nextState });
+  await showText({
+    title: 'Backup run details',
+    message: `${safeText(run.type, 'Backup run')} · ${safeText(run.result, 'Result unavailable')}`,
+    detail: formatRunDetails(run),
+  });
+  return { ok: true, state: nextState, message: 'Run details opened.' };
+}
+
 function normalizeRestoreSnapshotList(value) {
   const entries = Array.isArray(value) ? value : value && Array.isArray(value.snapshots) ? value.snapshots : [];
   return entries.map((entry) => {
@@ -607,7 +730,9 @@ async function createService() {
   }
   service = instance;
   serviceStateListener = (nextState) => {
-    postNativeMessage({ type: 'state', state: applyPresentation(nextState) });
+    const state = applyPresentation(nextState);
+    postNativeMessage({ type: 'state', state });
+    adjustStateHeartbeat(state);
   };
   if (typeof service.on === 'function') service.on('state', serviceStateListener);
   if (typeof service.initialize === 'function') await service.initialize();
@@ -627,11 +752,19 @@ function postNativeMessage(message) {
 async function sendState() {
   const state = await currentState();
   postNativeMessage({ type: 'state', state });
+  adjustStateHeartbeat(state);
   return state;
 }
 
 async function executeCommand(command, payload) {
   if (command === 'openRestore' && !payload.destination) return openRestoreFlow();
+  if (command === 'viewRunDetails') return showRunDetails(payload.runId);
+  if (command === 'togglePreview') {
+    const rawState = await service.getState();
+    if (!rawState.preview && rawState.status && rawState.status.active) {
+      throw new Error('Stop the active backup before previewing animations.');
+    }
+  }
   const result = await service.execute(command, payload);
   if (command === 'setTheme' && (!result || result.ok !== false)) {
     await persistTheme(payload.theme);
@@ -640,6 +773,7 @@ async function executeCommand(command, payload) {
   if (!nextState) nextState = await currentState();
   nextState = applyPresentation(nextState);
   postNativeMessage({ type: 'state', state: nextState });
+  adjustStateHeartbeat(nextState);
   return { ok: result && result.ok === false ? false : true, message: result && result.message, state: nextState };
 }
 
@@ -735,6 +869,7 @@ async function createMainWindow() {
       clearInterval(stateHeartbeat);
       stateHeartbeat = null;
     }
+    stateHeartbeatDelay = 0;
     mainWindow = null;
   });
   if (smokeMode) {
@@ -754,16 +889,26 @@ async function createMainWindow() {
   });
   await mainWindow.loadFile(web.index);
   mainWindow.show();
-  startStateHeartbeat();
+  startStateHeartbeat(5000);
   return mainWindow;
 }
 
-function startStateHeartbeat() {
+function adjustStateHeartbeat(state) {
+  if (!mainWindow || mainWindow.isDestroyed() || !stateHeartbeat) return;
+  const nextDelay = state && state.preview ? 500 : 5000;
+  if (nextDelay !== stateHeartbeatDelay) startStateHeartbeat(nextDelay);
+}
+
+function startStateHeartbeat(delay = 5000) {
   if (stateHeartbeat) clearInterval(stateHeartbeat);
+  stateHeartbeatDelay = delay;
   stateHeartbeat = setInterval(() => {
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    void currentState().then((state) => postNativeMessage({ type: 'state', state })).catch(() => undefined);
-  }, 5000);
+    void currentState().then((state) => {
+      postNativeMessage({ type: 'state', state });
+      adjustStateHeartbeat(state);
+    }).catch(() => undefined);
+  }, delay);
   stateHeartbeat.unref?.();
 }
 
