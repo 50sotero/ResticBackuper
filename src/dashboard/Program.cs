@@ -12,6 +12,8 @@ namespace ResticBackuper.Dashboard
     {
         private const string MutexName = @"Local\ResticBackuperDashboard.Instance";
         private const string ShowEventName = @"Local\ResticBackuperDashboard.Show";
+        private const string PresentationMutexName = @"Local\ResticBackuperDashboard.Presentation.Instance";
+        private const string PresentationShowEventName = @"Local\ResticBackuperDashboard.Presentation.Show";
         private static Mutex instanceMutex;
         private static EventWaitHandle showEvent;
 
@@ -57,21 +59,29 @@ namespace ResticBackuper.Dashboard
             if (principal.IsInRole(WindowsBuiltInRole.Administrator))
             {
                 MessageBox.Show(
-                    "This read-only dashboard intentionally runs without administrator privileges. " +
+                    "This dashboard intentionally runs without administrator privileges. " +
+                    "Protected folder changes and manual backup requests ask for Windows approval when needed. " +
                     "Please launch it normally instead of using Run as administrator.",
-                    "ResticBackuper Dashboard",
+                    "Rewindle",
                     MessageBoxButton.OK,
                     MessageBoxImage.Information);
                 return 3;
             }
 
+            string mutexName = options.UseIsolatedPresentationStore
+                ? PresentationMutexName
+                : MutexName;
+            string showEventName = options.UseIsolatedPresentationStore
+                ? PresentationShowEventName
+                : ShowEventName;
+
             bool createdNew;
-            instanceMutex = new Mutex(true, MutexName, out createdNew);
+            instanceMutex = new Mutex(true, mutexName, out createdNew);
             if (!createdNew)
             {
                 try
                 {
-                    using (EventWaitHandle existing = EventWaitHandle.OpenExisting(ShowEventName))
+                    using (EventWaitHandle existing = EventWaitHandle.OpenExisting(showEventName))
                     {
                         existing.Set();
                     }
@@ -82,7 +92,7 @@ namespace ResticBackuper.Dashboard
                 return 0;
             }
 
-            showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
+            showEvent = new EventWaitHandle(false, EventResetMode.AutoReset, showEventName);
             Application application = new Application();
             application.ShutdownMode = ShutdownMode.OnExplicitShutdown;
             application.DispatcherUnhandledException += OnDispatcherUnhandledException;
@@ -102,7 +112,7 @@ namespace ResticBackuper.Dashboard
         {
             MessageBox.Show(
                 "The backup dashboard hit an unexpected display error.\n\n" + args.Exception.Message,
-                "ResticBackuper Dashboard",
+                "Rewindle",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             args.Handled = true;
@@ -114,6 +124,8 @@ namespace ResticBackuper.Dashboard
         public string StateDirectory { get; private set; }
         public bool StartMinimized { get; private set; }
         public bool Preview { get; private set; }
+        public bool UseIsolatedPresentationStore { get; private set; }
+        public bool UseNativePresentation { get; private set; }
         public bool SelfTest { get; private set; }
         public string SelfTestOutput { get; private set; }
 
@@ -137,6 +149,14 @@ namespace ResticBackuper.Dashboard
                 else if (string.Equals(argument, "--preview", StringComparison.OrdinalIgnoreCase))
                 {
                     result.Preview = true;
+                }
+                else if (string.Equals(argument, "--isolated-presentation-store", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.UseIsolatedPresentationStore = true;
+                }
+                else if (string.Equals(argument, "--native", StringComparison.OrdinalIgnoreCase))
+                {
+                    result.UseNativePresentation = true;
                 }
                 else if (string.Equals(argument, "--self-test", StringComparison.OrdinalIgnoreCase))
                 {

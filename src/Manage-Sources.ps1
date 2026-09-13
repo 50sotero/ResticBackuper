@@ -22,6 +22,7 @@ $env:PSModulePath = $trustedModuleRoot
 $productName = 'ResticBackuper'
 $programFilesRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
 $programDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+$localAppDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
 $defaultInstallRoot = [IO.Path]::GetFullPath((Join-Path $programFilesRoot $productName)).TrimEnd('\')
 $isTestMode = -not [string]::IsNullOrWhiteSpace($TestRoot)
 if ($isTestMode) {
@@ -38,6 +39,21 @@ if ($isTestMode) {
 else {
     $installRoot = $defaultInstallRoot
     $stateRoot = [IO.Path]::GetFullPath((Join-Path $programDataRoot $productName)).TrimEnd('\')
+}
+$localNtfsMode = 'local_ntfs'
+$driveFsMode = 'google_drivefs_stream'
+$expectedDriveFsRoot = if ($isTestMode) {
+    [IO.Path]::GetFullPath((Join-Path $testContainer 'DriveFs\My Drive')).TrimEnd('\')
+} else { 'G:\My Drive' }
+$expectedDriveFsCache = if ($isTestMode) {
+    [IO.Path]::GetFullPath((Join-Path $testContainer 'LocalAppData\Google\DriveFS')).TrimEnd('\')
+} else {
+    [IO.Path]::GetFullPath((Join-Path $localAppDataRoot 'Google\DriveFS')).TrimEnd('\')
+}
+$driveFsRecoveryRoot = if ($isTestMode) {
+    [IO.Path]::GetFullPath((Join-Path $testContainer 'ProgramData\ResticBackuperRecoveryTools')).TrimEnd('\')
+} else {
+    [IO.Path]::GetFullPath((Join-Path $programDataRoot 'ResticBackuperRecoveryTools')).TrimEnd('\')
 }
 $configPath = Join-Path $installRoot 'backup-config.json'
 $runtimeManifestPath = Join-Path $installRoot 'runtime-manifest.json'
@@ -260,6 +276,147 @@ function Set-JsonProperty {
     }
 }
 
+function Get-ConfiguredStorageBinding {
+    param(
+        [object]$Configuration,
+        [string]$Repository,
+        [string]$RecoveryTools
+    )
+    $modeProperty = $Configuration.PSObject.Properties['repository_storage_mode']
+    $mode = if ($null -eq $modeProperty) { $localNtfsMode } else { [string]$modeProperty.Value }
+    if ($mode -notin @($localNtfsMode, $driveFsMode)) {
+        throw 'Configured repository_storage_mode is unsupported.'
+    }
+    $rootProperty = $Configuration.PSObject.Properties['drivefs_my_drive_root']
+    $legacyRootProperty = $Configuration.PSObject.Properties['repository_drivefs_root']
+    $cacheProperty = $Configuration.PSObject.Properties['drivefs_cache_directory']
+    if ($mode -eq $localNtfsMode) {
+        if ($null -ne $rootProperty -or $null -ne $legacyRootProperty -or $null -ne $cacheProperty) {
+            throw 'DriveFS path bindings are invalid with local_ntfs.'
+        }
+        $repositoryParent = Split-Path -Parent $Repository
+        if ([string]::IsNullOrWhiteSpace($repositoryParent)) {
+            throw 'The local_ntfs repository must not be a drive root.'
+        }
+        $expectedRecovery = Get-CanonicalLocalPath -Value (
+            Join-Path $repositoryParent 'RecoveryTools')
+        if (-not (Test-PathEqual -Left $RecoveryTools -Right $expectedRecovery)) {
+            throw 'The local_ntfs recovery-tools directory is not the repository sibling required by v1.'
+        }
+        return [pscustomobject]@{
+            Mode = $mode
+            DriveFsRoot = $null
+            DriveFsCache = $null
+        }
+    }
+
+    $rawRoot = if ($null -ne $rootProperty) {
+        [string]$rootProperty.Value
+    }
+    elseif ($null -ne $legacyRootProperty) {
+        [string]$legacyRootProperty.Value
+    }
+    else { '' }
+    if ($null -ne $rootProperty -and $null -ne $legacyRootProperty) {
+        $canonicalRoot = Get-CanonicalLocalPath -Value ([string]$rootProperty.Value)
+        $canonicalLegacyRoot = Get-CanonicalLocalPath -Value ([string]$legacyRootProperty.Value)
+        if (-not (Test-PathEqual -Left $canonicalRoot -Right $canonicalLegacyRoot)) {
+            throw 'drivefs_my_drive_root conflicts with legacy repository_drivefs_root.'
+        }
+    }
+    $root = Get-CanonicalLocalPath -Value $rawRoot
+    $cache = if ($null -ne $cacheProperty) {
+        Get-CanonicalLocalPath -Value ([string]$cacheProperty.Value)
+    }
+    elseif ($null -ne $legacyRootProperty) {
+        $expectedDriveFsCache
+    }
+    else {
+        throw 'google_drivefs_stream requires drivefs_cache_directory.'
+    }
+    if (-not (Test-PathEqual -Left $root -Right $expectedDriveFsRoot) -or
+        -not (Test-PathEqual -Left $cache -Right $expectedDriveFsCache)) {
+        throw 'Google DriveFS root/cache bindings do not match the supported current-user provider.'
+    }
+    if (-not (Test-IsWithin -Candidate $Repository -Parent $root) -or
+        (Test-PathEqual -Left $Repository -Right $root)) {
+        throw 'DriveFS repository is not strictly beneath drivefs_my_drive_root.'
+    }
+    if (-not (Test-PathEqual -Left $RecoveryTools -Right $driveFsRecoveryRoot)) {
+        throw 'DriveFS recovery tools must remain in the protected NTFS recovery root.'
+    }
+    return [pscustomobject]@{
+        Mode = $mode
+        DriveFsRoot = $root
+        DriveFsCache = $cache
+    }
+}
+
+function Assert-NtfsLocalPath {
+    param([string]$Path, [string]$Label)
+    $root = [IO.Path]::GetPathRoot($Path)
+    $drive = [IO.DriveInfo]::new($root)
+    if (-not $drive.IsReady -or
+        $drive.DriveType -notin @([IO.DriveType]::Fixed, [IO.DriveType]::Removable) -or
+        -not [string]::Equals($drive.DriveFormat, 'NTFS', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Label must remain on a ready local NTFS volume: $Path"
+    }
+}
+
+function Assert-ConfiguredStorageLocations {
+    param(
+        [object]$Configuration,
+        [string]$Repository,
+        [string]$RecoveryTools,
+        [pscustomobject]$Storage
+    )
+    foreach ($directory in @($Repository, $RecoveryTools)) {
+        Assert-NormalDirectoryChain -Directory $directory
+    }
+    Assert-NormalFile -File (Join-Path $Repository 'config')
+    Assert-NtfsLocalPath -Path $stateRoot -Label 'ProgramData state'
+    Assert-NtfsLocalPath -Path $RecoveryTools -Label 'Recovery tools'
+    Assert-NoOverlap -Candidate $stateRoot -Other $RecoveryTools `
+        -Message 'ProgramData state overlaps RecoveryTools'
+
+    $repositoryDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($Repository))
+    if (-not $repositoryDrive.IsReady -or
+        $repositoryDrive.DriveType -notin @([IO.DriveType]::Fixed, [IO.DriveType]::Removable)) {
+        throw 'The configured repository is not on a ready supported drive.'
+    }
+    if ($Storage.Mode -eq $localNtfsMode) {
+        if (-not [string]::Equals($repositoryDrive.DriveFormat, 'NTFS', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The configured local_ntfs repository is not on NTFS.'
+        }
+        $recoveryDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($RecoveryTools))
+        if (-not (Test-PathEqual -Left $repositoryDrive.RootDirectory.FullName `
+            -Right $recoveryDrive.RootDirectory.FullName)) {
+            throw 'The local_ntfs RecoveryTools directory is not on the repository volume.'
+        }
+    }
+    else {
+        foreach ($directory in @($Storage.DriveFsRoot, $Storage.DriveFsCache)) {
+            Assert-NormalDirectoryChain -Directory $directory
+        }
+        Assert-NtfsLocalPath -Path $Storage.DriveFsCache -Label 'Google DriveFS cache'
+        if (-not $isTestMode -and
+            ($repositoryDrive.DriveType -ne [IO.DriveType]::Fixed -or
+             -not [string]::Equals($repositoryDrive.DriveFormat, 'FAT32', [StringComparison]::OrdinalIgnoreCase))) {
+            throw 'The configured DriveFS repository is not on the supported fixed FAT32 streaming mount.'
+        }
+    }
+    if (-not $isTestMode) {
+        $actualSerial = Get-LocalVolumeSerialHex -Directory $Repository
+        if (-not [string]::Equals(
+            $actualSerial,
+            [string]$Configuration.repository_volume_serial,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw 'The configured repository volume serial does not match the currently mounted volume.'
+        }
+    }
+}
+
 function Get-Sha256Hex {
     param([byte[]]$Bytes)
     $algorithm = [Security.Cryptography.SHA256]::Create()
@@ -469,8 +626,8 @@ function Get-SourceUpdateTargetPaths {
             [void](Get-RequiredProperty -Object $configuration -Name $name)
         }
     }
-    Assert-NonSourceFieldsPreserved -Before $oldConfig -After $newConfig `
-        -Message 'The source-update journal changes a protected non-source configuration field.'
+    Assert-SourceConfigurationTransition -Before $oldConfig -After $newConfig `
+        -Message 'The source-update journal contains an invalid configuration transition.'
     $repository = Get-CanonicalLocalPath -Value ([string]$oldConfig.repository)
     $configuredState = Get-CanonicalLocalPath -Value ([string]$oldConfig.state_directory)
     if (-not (Test-PathEqual -Left $configuredState -Right $stateRoot)) {
@@ -480,33 +637,11 @@ function Get-SourceUpdateTargetPaths {
         [string]$oldConfig.repository_volume_serial -notmatch '^[0-9A-Fa-f]{8}$') {
         throw 'The source-update journal contains an invalid repository volume serial.'
     }
-    $repositoryParent = Split-Path -Parent $repository
-    if ([string]::IsNullOrWhiteSpace($repositoryParent)) {
-        throw 'The source-update journal repository must not be a drive root.'
-    }
-    $recoveryTools = Get-CanonicalLocalPath -Value (Join-Path $repositoryParent 'RecoveryTools')
-    $configuredRecovery = Get-CanonicalLocalPath -Value ([string]$oldConfig.recovery_tools_directory)
-    if (-not (Test-PathEqual -Left $configuredRecovery -Right $recoveryTools)) {
-        throw 'The source-update journal does not name the repository-sibling RecoveryTools directory.'
-    }
-    foreach ($directory in @($repository, $recoveryTools)) {
-        Assert-NormalDirectoryChain -Directory $directory
-    }
-    Assert-NormalFile -File (Join-Path $repository 'config')
-    $repositoryDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($repository))
-    $recoveryDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($recoveryTools))
-    if (-not $repositoryDrive.IsReady -or
-        $repositoryDrive.DriveType -notin @([IO.DriveType]::Fixed, [IO.DriveType]::Removable) -or
-        -not $recoveryDrive.IsReady -or
-        -not (Test-PathEqual -Left $repositoryDrive.RootDirectory.FullName -Right $recoveryDrive.RootDirectory.FullName)) {
-        throw 'The source-update journal RecoveryTools target is not on the ready local repository volume.'
-    }
-    if (-not $isTestMode) {
-        $actualSerial = Get-LocalVolumeSerialHex -Directory $repository
-        if (-not [string]::Equals($actualSerial, [string]$oldConfig.repository_volume_serial, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'The source-update journal repository volume serial does not match the currently mounted volume.'
-        }
-    }
+    $recoveryTools = Get-CanonicalLocalPath -Value ([string]$oldConfig.recovery_tools_directory)
+    $storage = Get-ConfiguredStorageBinding -Configuration $oldConfig `
+        -Repository $repository -RecoveryTools $recoveryTools
+    Assert-ConfiguredStorageLocations -Configuration $oldConfig -Repository $repository `
+        -RecoveryTools $recoveryTools -Storage $storage
     return [ordered]@{
         protected_config = $configPath
         runtime_manifest = $runtimeManifestPath
@@ -869,6 +1004,59 @@ function Assert-SourceListsEqual {
     }
 }
 
+function Assert-RecoveryStorageBinding {
+    param([object]$Configuration, [pscustomobject]$Validated)
+    $modeProperty = $Configuration.PSObject.Properties['repository_storage_mode']
+    $mode = if ($null -eq $modeProperty) { $localNtfsMode } else { [string]$modeProperty.Value }
+    if (-not [string]::Equals($mode, $Validated.StorageMode, [StringComparison]::Ordinal)) {
+        throw 'Recovery repository_storage_mode is not synchronized with the protected configuration.'
+    }
+    $rootProperty = $Configuration.PSObject.Properties['drivefs_my_drive_root']
+    $legacyRootProperty = $Configuration.PSObject.Properties['repository_drivefs_root']
+    $cacheProperty = $Configuration.PSObject.Properties['drivefs_cache_directory']
+    if ($mode -eq $localNtfsMode) {
+        if ($null -ne $rootProperty -or $null -ne $legacyRootProperty -or $null -ne $cacheProperty) {
+            throw 'Recovery configuration contains DriveFS bindings for local_ntfs.'
+        }
+        return
+    }
+    if ($mode -ne $driveFsMode) {
+        throw 'Recovery repository_storage_mode is unsupported.'
+    }
+    $rawRoot = if ($null -ne $rootProperty) {
+        [string]$rootProperty.Value
+    }
+    elseif ($null -ne $legacyRootProperty) {
+        [string]$legacyRootProperty.Value
+    }
+    else { '' }
+    $root = Get-CanonicalLocalPath -Value $rawRoot
+    $cache = if ($null -ne $cacheProperty) {
+        Get-CanonicalLocalPath -Value ([string]$cacheProperty.Value)
+    }
+    elseif ($null -ne $legacyRootProperty) {
+        $expectedDriveFsCache
+    }
+    else { throw 'Recovery google_drivefs_stream configuration lacks its cache binding.' }
+    if (-not (Test-PathEqual -Left $root -Right $Validated.DriveFsRoot) -or
+        -not (Test-PathEqual -Left $cache -Right $Validated.DriveFsCache)) {
+        throw 'Recovery Google DriveFS bindings are not synchronized with the protected configuration.'
+    }
+    foreach ($name in @(
+        'state_directory', 'secret_file', 'recovery_key_file', 'recovery_tools_directory',
+        'restic_executable', 'python_executable', 'exclude_file'
+    )) {
+        $property = $Configuration.PSObject.Properties[$name]
+        if ($null -ne $property -and $property.Value -is [string] -and
+            -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            $path = Get-CanonicalLocalPath -Value ([string]$property.Value)
+            if (Test-IsWithin -Candidate $path -Parent $root) {
+                throw "Recovery $name must remain outside Google DriveFS."
+            }
+        }
+    }
+}
+
 function Get-ValidatedConfiguration {
     param(
         [string]$File,
@@ -881,10 +1069,28 @@ function Get-ValidatedConfiguration {
         throw 'Unsupported backup configuration schema.'
     }
     foreach ($name in @(
+        'plan_id', 'config_generation', 'cloud_placeholder_policy', 'source_identities',
         'repository', 'repository_volume_serial', 'restic_executable', 'recovery_tools_directory',
         'python_executable', 'state_directory', 'secret_file', 'recovery_key_file', 'exclude_file',
         'canary_file', 'hostname', 'scheduled_tag', 'sources', 'use_vss'
     )) { [void](Get-RequiredProperty -Object $configuration -Name $name) }
+
+    $parsedPlanId = [Guid]::Empty
+    if ($configuration.plan_id -isnot [string] -or
+        -not [Guid]::TryParseExact([string]$configuration.plan_id, 'D', [ref]$parsedPlanId) -or
+        -not [string]::Equals([string]$configuration.plan_id, $parsedPlanId.ToString('D'), [StringComparison]::Ordinal)) {
+        throw 'Backup plan_id must be a canonical UUID.'
+    }
+    if (($configuration.config_generation -isnot [int] -and
+        $configuration.config_generation -isnot [long]) -or
+        [long]$configuration.config_generation -le 0 -or
+        [long]$configuration.config_generation -eq [long]::MaxValue) {
+        throw 'Backup config_generation must be a positive incrementable integer.'
+    }
+    if ($configuration.cloud_placeholder_policy -isnot [string] -or
+        [string]$configuration.cloud_placeholder_policy -notin @('strict', 'allow')) {
+        throw 'Backup cloud_placeholder_policy must be strict or allow.'
+    }
 
     $repository = Get-CanonicalLocalPath -Value ([string]$configuration.repository)
     $configuredState = Get-CanonicalLocalPath -Value ([string]$configuration.state_directory)
@@ -921,12 +1127,10 @@ function Get-ValidatedConfiguration {
         throw 'Configured use_vss value must be a JSON Boolean.'
     }
 
-    $repositoryParent = Split-Path -Parent $repository
-    if ([string]::IsNullOrWhiteSpace($repositoryParent)) { throw 'The repository must not be a drive root.' }
-    $expectedRecoveryTools = Get-CanonicalLocalPath -Value (Join-Path $repositoryParent 'RecoveryTools')
-    if (-not (Test-PathEqual -Left $recoveryTools -Right $expectedRecoveryTools)) {
-        throw "Configuration names an unexpected recovery-tools directory: $recoveryTools"
-    }
+    $storage = Get-ConfiguredStorageBinding -Configuration $configuration `
+        -Repository $repository -RecoveryTools $recoveryTools
+    Assert-ConfiguredStorageLocations -Configuration $configuration -Repository $repository `
+        -RecoveryTools $recoveryTools -Storage $storage
     foreach ($directory in @($installRoot, $stateRoot, $repository, $recoveryTools)) {
         Assert-NormalDirectoryChain -Directory $directory
     }
@@ -950,6 +1154,29 @@ function Get-ValidatedConfiguration {
         $source = Get-CanonicalLocalPath -Value ([string]$value)
         if (-not $sourceSet.Add($source)) { throw "Duplicate source in backup configuration: $source" }
         $sources.Add($source)
+    }
+
+    if ($configuration.source_identities -isnot [Management.Automation.PSCustomObject]) {
+        throw 'Backup source_identities must be one JSON object.'
+    }
+    $identityProperties = @($configuration.source_identities.PSObject.Properties)
+    if ($identityProperties.Count -ne $sources.Count) {
+        throw 'Backup source_identities must contain exactly one entry per source.'
+    }
+    foreach ($source in $sources) {
+        $matches = @($identityProperties | Where-Object {
+            [string]::Equals($_.Name, $source, [StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($matches.Count -ne 1 -or
+            -not [string]::Equals($matches[0].Name, $source, [StringComparison]::Ordinal)) {
+            throw "A source volume identity is missing, duplicated, or non-canonical: $source"
+        }
+        $identity = $matches[0].Value
+        if ($identity -isnot [Management.Automation.PSCustomObject] -or
+            $identity.expected_volume_serial -isnot [string] -or
+            [string]$identity.expected_volume_serial -notmatch '^[0-9A-F]{8}$') {
+            throw "A source volume identity is invalid: $source"
+        }
     }
 
     $canarySource = Get-CanonicalLocalPath -Value (Split-Path -Parent $canaryFile)
@@ -999,7 +1226,13 @@ function Get-ValidatedConfiguration {
         RecoveryTools = $recoveryTools
         CanarySource = $canarySource
         Sources = @($sources)
+        SourceIdentities = $configuration.source_identities
+        PlanId = [string]$configuration.plan_id
+        ConfigGeneration = [long]$configuration.config_generation
         UseVss = [bool]$configuration.use_vss
+        StorageMode = $storage.Mode
+        DriveFsRoot = $storage.DriveFsRoot
+        DriveFsCache = $storage.DriveFsCache
     }
 }
 
@@ -1038,7 +1271,11 @@ function Get-ValidatedRuntimeManifest {
     }
     $actualFiles = @(
         Get-ChildItem -LiteralPath $installRoot -Recurse -File -Force |
-            Where-Object Name -ne 'runtime-manifest.json'
+            Where-Object Name -notin @(
+                'runtime-manifest.json',
+                'scheduled-task.xml',
+                'google-drive-verification-task.xml'
+            )
     )
     if ($actualFiles.Count -ne $records.Count) { throw 'Runtime contains unmanifested or missing files.' }
     foreach ($file in $actualFiles) {
@@ -1102,7 +1339,19 @@ function Get-ValidatedRecoveryBundle {
         $recoveryConfig.use_vss -isnot [bool]) {
         throw 'Recovery configuration does not match the protected repository.'
     }
+    Assert-RecoveryStorageBinding -Configuration $recoveryConfig -Validated $Validated
     Assert-SourceListsEqual -Expected $Validated.Sources -Actual @($recoveryConfig.sources) -Message 'Recovery source list is not synchronized with the protected configuration.'
+    if ($recoveryConfig.plan_id -isnot [string] -or
+        -not [string]::Equals([string]$recoveryConfig.plan_id, $Validated.PlanId, [StringComparison]::Ordinal) -or
+        ($recoveryConfig.config_generation -isnot [int] -and $recoveryConfig.config_generation -isnot [long]) -or
+        [long]$recoveryConfig.config_generation -ne $Validated.ConfigGeneration) {
+        throw 'Recovery backup-plan identity is not synchronized with the protected configuration.'
+    }
+    $protectedIdentityJson = $Validated.Json.source_identities | ConvertTo-Json -Depth 10 -Compress
+    $recoveryIdentityJson = $recoveryConfig.source_identities | ConvertTo-Json -Depth 10 -Compress
+    if ($protectedIdentityJson -cne $recoveryIdentityJson) {
+        throw 'Recovery source volume identities are not synchronized with the protected configuration.'
+    }
     if ([bool]$recoveryConfig.use_vss -ne $Validated.UseVss) {
         throw 'Recovery VSS setting is not synchronized with the protected configuration.'
     }
@@ -1138,15 +1387,23 @@ function New-ManifestBytesForReplacement {
     return ConvertTo-Utf8JsonBytes -Value $Manifest
 }
 
-function Assert-NonSourceFieldsPreserved {
+function Assert-SourceConfigurationTransition {
     param([object]$Before, [object]$After, [string]$Message)
-    $beforeNames = @($Before.PSObject.Properties.Name | Where-Object { $_ -ne 'sources' } | Sort-Object)
-    $afterNames = @($After.PSObject.Properties.Name | Where-Object { $_ -ne 'sources' } | Sort-Object)
+    $mutable = @('sources', 'source_identities', 'config_generation')
+    $beforeNames = @($Before.PSObject.Properties.Name | Where-Object { $_ -notin $mutable } | Sort-Object)
+    $afterNames = @($After.PSObject.Properties.Name | Where-Object { $_ -notin $mutable } | Sort-Object)
     if (($beforeNames -join "`n") -ne ($afterNames -join "`n")) { throw $Message }
     foreach ($name in $beforeNames) {
         $beforeText = $Before.$name | ConvertTo-Json -Depth 20 -Compress
         $afterText = $After.$name | ConvertTo-Json -Depth 20 -Compress
         if ($beforeText -ne $afterText) { throw "$Message Field: $name" }
+    }
+    if (($Before.config_generation -isnot [int] -and $Before.config_generation -isnot [long]) -or
+        ($After.config_generation -isnot [int] -and $After.config_generation -isnot [long]) -or
+        [long]$Before.config_generation -le 0 -or
+        [long]$Before.config_generation -eq [long]::MaxValue -or
+        [long]$After.config_generation -ne ([long]$Before.config_generation + 1)) {
+        throw "$Message Configuration generation did not increase exactly once."
     }
 }
 
@@ -1162,6 +1419,8 @@ function Set-ConfigurationAndRecovery {
     $beforeLive = ([Text.UTF8Encoding]::new($false, $true).GetString($Validated.RawBytes) | ConvertFrom-Json)
     $beforeRecovery = ([Text.UTF8Encoding]::new($false, $true).GetString($Recovery.RawConfigBytes) | ConvertFrom-Json)
     $Recovery.Config.sources = @($NewSources)
+    Set-JsonProperty -Object $Recovery.Config -Name 'source_identities' -Value $Validated.Json.source_identities
+    Set-JsonProperty -Object $Recovery.Config -Name 'config_generation' -Value ([long]$Validated.Json.config_generation)
     $newRecoveryConfigBytes = ConvertTo-Utf8JsonBytes -Value $Recovery.Config
     $newRuntimeManifestBytes = New-ManifestBytesForReplacement `
         -Manifest $Runtime.Json -PathProperty 'relative_path' -ReplacementName 'backup-config.json' `
@@ -1180,10 +1439,10 @@ function Set-ConfigurationAndRecovery {
     $verify = {
         $finalLive = Get-ValidatedConfiguration -File $configPath -AllowOfflineNonCanary
         Assert-SourceListsEqual -Expected $NewSources -Actual $finalLive.Sources -Message 'Published protected source list differs from staged data.'
-        Assert-NonSourceFieldsPreserved -Before $beforeLive -After $finalLive.Json -Message 'A non-source protected configuration field changed.'
+        Assert-SourceConfigurationTransition -Before $beforeLive -After $finalLive.Json -Message 'The protected configuration transition is invalid.'
         [void](Get-ValidatedRuntimeManifest -Validated $finalLive)
         $finalRecovery = Get-ValidatedRecoveryBundle -Validated $finalLive
-        Assert-NonSourceFieldsPreserved -Before $beforeRecovery -After $finalRecovery.Config -Message 'A recovery standalone configuration field changed.'
+        Assert-SourceConfigurationTransition -Before $beforeRecovery -After $finalRecovery.Config -Message 'The recovery configuration transition is invalid.'
     }
     Invoke-AtomicFileSet -Updates $updates -Verify $verify -FailAfterPublish $FailAfterPublish -UserSid $currentSid
 }
@@ -1295,6 +1554,21 @@ try {
 
     if ($changed) {
         $validated.Json.sources = @($sources)
+        $newIdentities = [ordered]@{}
+        foreach ($source in $sources) {
+            $existingIdentity = @($validated.SourceIdentities.PSObject.Properties | Where-Object {
+                [string]::Equals($_.Name, $source, [StringComparison]::OrdinalIgnoreCase)
+            })
+            $serial = if ($existingIdentity.Count -eq 1) {
+                [string]$existingIdentity[0].Value.expected_volume_serial
+            }
+            else {
+                Get-LocalVolumeSerialHex -Directory $source
+            }
+            $newIdentities[$source] = [ordered]@{ expected_volume_serial = $serial.ToUpperInvariant() }
+        }
+        Set-JsonProperty -Object $validated.Json -Name 'source_identities' -Value ([pscustomobject]$newIdentities)
+        Set-JsonProperty -Object $validated.Json -Name 'config_generation' -Value ($validated.ConfigGeneration + 1)
         $newConfigBytes = ConvertTo-Utf8JsonBytes -Value $validated.Json
         Set-ConfigurationAndRecovery -Validated $validated -Runtime $runtime -Recovery $recovery `
             -NewSources @($sources) -NewConfigBytes $newConfigBytes -FailAfterPublish $TestFailAfterPublish
@@ -1306,6 +1580,9 @@ try {
         action = $Action.ToLowerInvariant()
         changed = $changed
         path = $changedPath
+        plan_id = $validated.PlanId
+        previous_config_generation = $validated.ConfigGeneration
+        config_generation = $(if ($changed) { $validated.ConfigGeneration + 1 } else { $validated.ConfigGeneration })
         user_source_count = $userSources.Count
         source_count = $sources.Count
         canary_source = $validated.CanarySource

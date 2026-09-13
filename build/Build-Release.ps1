@@ -13,6 +13,8 @@ $buildOutputRoot = Join-Path $projectRoot 'build\build-output'
 $bundleRoot = Join-Path $buildOutputRoot 'ResticBackuper'
 $payloadRoot = Join-Path $bundleRoot 'payload'
 $artifactsRoot = Join-Path $projectRoot 'artifacts'
+$framework = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319'
+$compiler = Join-Path $framework 'csc.exe'
 
 function Write-Utf8NoBom {
     param([string]$Path, [string]$Text)
@@ -105,6 +107,70 @@ function New-PayloadManifest {
     return $manifest
 }
 
+function Assert-DashboardAssetsManifest {
+    param(
+        [string]$Root,
+        [string]$ManifestPath
+    )
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Dashboard assets manifest is missing: $ManifestPath"
+    }
+    $manifest = Get-Content -LiteralPath $ManifestPath -Raw | ConvertFrom-Json
+    if ($manifest.schema_version -ne 1 -or -not ($manifest.PSObject.Properties.Name -contains 'files')) {
+        throw 'Dashboard assets manifest schema is invalid.'
+    }
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in @($manifest.files)) {
+        $relative = ([string]$entry.relative_path).Replace('/', '\')
+        if (
+            [string]::IsNullOrWhiteSpace($relative) -or
+            [IO.Path]::IsPathRooted($relative) -or
+            $relative.Split('\') -contains '..' -or
+            $relative -match '[<>:"|?*]' -or
+            -not $seen.Add($relative)
+        ) {
+            throw "Dashboard assets manifest contains an unsafe or duplicate path: $relative"
+        }
+        if (
+            -not $relative.StartsWith('web\', [StringComparison]::OrdinalIgnoreCase) -and
+            -not $relative.StartsWith('licenses\', [StringComparison]::OrdinalIgnoreCase) -and
+            $relative -notin @(
+                'Microsoft.Web.WebView2.Core.dll',
+                'Microsoft.Web.WebView2.Wpf.dll',
+                'WebView2Loader.dll'
+            )
+        ) {
+            throw "Dashboard assets manifest contains an unexpected path: $relative"
+        }
+        $path = [IO.Path]::GetFullPath((Join-Path $Root $relative))
+        $prefix = [IO.Path]::GetFullPath($Root).TrimEnd('\') + '\'
+        if (-not $path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Dashboard assets manifest path escapes its root: $relative"
+        }
+        $item = Get-Item -LiteralPath $path -Force
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw "Dashboard assets manifest member is not a regular file: $relative"
+        }
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        [long]$bytes = 0
+        if (-not [long]::TryParse([string]$entry.bytes, [ref]$bytes) -or $bytes -lt 0 -or $item.Length -ne $bytes -or $hash -ne [string]$entry.sha256) {
+            throw "Dashboard assets manifest integrity check failed: $relative"
+        }
+    }
+    foreach ($required in @(
+        'web\index.html',
+        'Microsoft.Web.WebView2.Core.dll',
+        'Microsoft.Web.WebView2.Wpf.dll',
+        'WebView2Loader.dll'
+    )) {
+        if (-not $seen.Contains($required)) {
+            throw "Dashboard assets manifest is missing required member: $required"
+        }
+    }
+    return $manifest
+}
+
 function New-DeterministicZip {
     param([string]$SourceDirectory, [string]$Destination)
     Add-Type -AssemblyName System.IO.Compression
@@ -186,14 +252,34 @@ if ($LASTEXITCODE -ne 0) { throw 'Task launcher build failed.' }
 & (Join-Path $projectRoot 'src\dashboard\build.ps1') | Out-Host
 if ($LASTEXITCODE -ne 0) { throw 'Dashboard build failed.' }
 
+$dashboardOutputRoot = Join-Path $projectRoot 'src\dashboard\dist'
+$dashboardAssetsManifestPath = Join-Path $dashboardOutputRoot 'dashboard-assets.json'
+$dashboardAssetsManifest = Assert-DashboardAssetsManifest `
+    -Root $dashboardOutputRoot `
+    -ManifestPath $dashboardAssetsManifestPath
+
 foreach ($name in @(
     'backup.py',
     'dry_run.py',
     'initialize_repository.py',
+    'refresh_recovery_tools.py',
+    'recovery_health.py',
+    'credential_repair.py',
+    'stale_lock_repair.py',
+    'key_rotation.py',
+    'anomaly_review.py',
     'restic_common.py',
     'restore.py',
     'secret_store.py',
+    'verify_my_drive_cloud_repository.ps1',
+    'verify_cloud_repository_inventory.py',
+    'reveal-rclone-config-password.ps1',
+    'install_google_drive_sync_task.ps1',
     'Manage-Sources.ps1',
+    'Manage-Schedule.ps1',
+    'Manage-Backup.ps1',
+    'Manage-Repository.ps1',
+    'Manage-Restore.ps1',
     'backup-canary.txt',
     'excludes.txt',
     'RECOVERY.md',
@@ -204,6 +290,13 @@ foreach ($name in @(
 Copy-PayloadFile -Source $resticExecutable -RelativeDestination 'restic.exe'
 Copy-PayloadFile -Source (Join-Path $projectRoot 'src\task_launcher\dist\ResticBackuperTaskLauncher.exe') -RelativeDestination 'ResticBackuperTaskLauncher.exe'
 Copy-PayloadFile -Source (Join-Path $projectRoot 'src\dashboard\dist\ResticBackuperDashboard.exe') -RelativeDestination 'ResticBackuperDashboard.exe'
+foreach ($entry in @($dashboardAssetsManifest.files)) {
+    $relative = ([string]$entry.relative_path).Replace('/', '\')
+    Copy-PayloadFile `
+        -Source (Join-Path $dashboardOutputRoot $relative) `
+        -RelativeDestination $relative
+}
+Copy-PayloadFile -Source $dashboardAssetsManifestPath -RelativeDestination 'dashboard-assets.json'
 Copy-PayloadFile -Source (Join-Path $projectRoot 'installer\Uninstall-ResticBackuper.ps1') -RelativeDestination 'Uninstall-ResticBackuper.ps1'
 Copy-PayloadFile -Source $versionPath -RelativeDestination 'VERSION'
 Copy-PayloadFile -Source (Join-Path $projectRoot 'LICENSE') -RelativeDestination 'LICENSE'
@@ -226,11 +319,23 @@ Copy-Item -LiteralPath $pythonLicense `
     -Destination (Join-Path $bundleLicenses 'PYTHON.txt') -Force
 $manifest = New-PayloadManifest
 
+$dashboardExecutablePath = Join-Path $payloadRoot 'ResticBackuperDashboard.exe'
+$dashboardExecutableSha256 = (Get-FileHash -LiteralPath $dashboardExecutablePath -Algorithm SHA256).Hash.ToLowerInvariant()
+$dashboardAssetsManifestSha256 = (Get-FileHash -LiteralPath (Join-Path $payloadRoot 'dashboard-assets.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+$bundleId = 'Rewindle/{0}/{1}/{2}' -f $version, $dashboardExecutableSha256, $dashboardAssetsManifestSha256
+
 $buildInfo = [ordered]@{
     schema_version = 1
     product = 'ResticBackuper'
     version = $version
+    bundle_id = $bundleId
     platform = 'windows-x64'
+    dashboard = [ordered]@{
+        executable = 'ResticBackuperDashboard.exe'
+        executable_sha256 = $dashboardExecutableSha256
+        assets_manifest = 'dashboard-assets.json'
+        assets_manifest_sha256 = $dashboardAssetsManifestSha256
+    }
     python = [ordered]@{
         version = [string]$dependencies.python.version
         archive_sha256 = [string]$dependencies.python.archive_sha256
@@ -245,12 +350,43 @@ $buildInfo = [ordered]@{
 Write-Utf8NoBom -Path (Join-Path $bundleRoot 'BUILD-INFO.json') -Text ($buildInfo | ConvertTo-Json -Depth 6)
 
 New-Item -ItemType Directory -Path $artifactsRoot -Force | Out-Null
-$artifactName = "ResticBackuper-v$version-windows-x64.zip"
+$artifactName = "Rewindle-v$version-windows-x64.zip"
 $artifactPath = Assert-PathWithinProject (Join-Path $artifactsRoot $artifactName)
 New-DeterministicZip -SourceDirectory $bundleRoot -Destination $artifactPath
 $artifactHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $checksumPath = $artifactPath + '.sha256'
 Write-Utf8NoBom -Path $checksumPath -Text ("$artifactHash *$artifactName`n")
+
+if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+    throw "The .NET Framework 4.8 C# compiler is unavailable: $compiler"
+}
+$setupArtifactName = "Rewindle-v$version-windows-x64-setup.exe"
+$setupArtifactPath = Assert-PathWithinProject (Join-Path $artifactsRoot $setupArtifactName)
+$setupSource = Join-Path $projectRoot 'installer\RewindleSetup.cs'
+$setupIcon = Join-Path $projectRoot 'src\dashboard\assets\dashboard-icon.ico'
+$setupArguments = @(
+    '/nologo',
+    '/target:winexe',
+    '/platform:x64',
+    '/optimize+',
+    ('/out:' + $setupArtifactPath),
+    ('/reference:' + (Join-Path $framework 'System.dll')),
+    ('/reference:' + (Join-Path $framework 'System.IO.Compression.dll')),
+    ('/reference:' + (Join-Path $framework 'System.IO.Compression.FileSystem.dll')),
+    ('/reference:' + (Join-Path $framework 'System.Windows.Forms.dll')),
+    ('/resource:' + $artifactPath + ',REWINDLE_BUNDLE')
+)
+if (Test-Path -LiteralPath $setupIcon -PathType Leaf) {
+    $setupArguments += '/win32icon:' + $setupIcon
+}
+$setupArguments += $setupSource
+& $compiler @setupArguments
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $setupArtifactPath -PathType Leaf)) {
+    throw "Rewindle setup compilation failed with exit code $LASTEXITCODE."
+}
+$setupHash = (Get-FileHash -LiteralPath $setupArtifactPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$setupChecksumPath = $setupArtifactPath + '.sha256'
+Write-Utf8NoBom -Path $setupChecksumPath -Text ("$setupHash *$setupArtifactName`n")
 
 [pscustomobject]@{
     version = $version
@@ -258,6 +394,10 @@ Write-Utf8NoBom -Path $checksumPath -Text ("$artifactHash *$artifactName`n")
     bytes = (Get-Item -LiteralPath $artifactPath).Length
     sha256 = $artifactHash
     checksum_file = $checksumPath
+    setup_artifact = $setupArtifactPath
+    setup_bytes = (Get-Item -LiteralPath $setupArtifactPath).Length
+    setup_sha256 = $setupHash
+    setup_checksum_file = $setupChecksumPath
     payload_files = $manifest.file_count
     restic_version = [string]$dependencies.restic.version
     python_version = [string]$dependencies.python.version

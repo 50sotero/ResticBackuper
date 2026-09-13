@@ -125,6 +125,11 @@ namespace ResticBackuper.Dashboard
         public string InstallRoot { get; private set; }
         public string ConfigurationPath { get; private set; }
         public string ManagerPath { get; private set; }
+        public string RepositoryPath { get; private set; }
+        public string StateDirectory { get; private set; }
+        public string PlanId { get; private set; }
+        public long ConfigGeneration { get; private set; }
+        public string CloudPlaceholderPolicy { get; private set; }
         public IList<BackupSourceView> Sources { get; private set; }
 
         private SourceConfiguration()
@@ -155,6 +160,54 @@ namespace ResticBackuper.Dashboard
             {
                 throw new InvalidDataException("The backup configuration is not a JSON object.");
             }
+
+            object planValue;
+            string planId = document.TryGetValue("plan_id", out planValue)
+                ? planValue as string
+                : null;
+            Guid parsedPlanId;
+            if (string.IsNullOrWhiteSpace(planId) ||
+                !Guid.TryParseExact(planId, "D", out parsedPlanId) ||
+                !string.Equals(planId, parsedPlanId.ToString("D"), StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    "The backup configuration contains an invalid plan identity.");
+            }
+
+            long configGeneration = ReadPositiveInteger(document, "config_generation");
+            object cloudPolicyValue;
+            string cloudPolicy = document.TryGetValue("cloud_placeholder_policy", out cloudPolicyValue)
+                ? cloudPolicyValue as string
+                : null;
+            if (cloudPolicy != "strict" && cloudPolicy != "allow")
+            {
+                throw new InvalidDataException(
+                    "The backup configuration contains an invalid cloud placeholder policy.");
+            }
+
+            object repositoryValue;
+            string repositoryPath = document.TryGetValue("repository", out repositoryValue)
+                ? repositoryValue as string
+                : null;
+            if (string.IsNullOrWhiteSpace(repositoryPath) || !Path.IsPathRooted(repositoryPath))
+            {
+                throw new InvalidDataException("The backup configuration contains an invalid repository path.");
+            }
+            repositoryPath = NormalizePath(repositoryPath);
+
+            object stateDirectoryValue;
+            string stateDirectory = document.TryGetValue(
+                "state_directory",
+                out stateDirectoryValue)
+                    ? stateDirectoryValue as string
+                    : null;
+            if (string.IsNullOrWhiteSpace(stateDirectory) ||
+                !Path.IsPathRooted(stateDirectory))
+            {
+                throw new InvalidDataException(
+                    "The backup configuration contains an invalid state directory.");
+            }
+            stateDirectory = NormalizePath(stateDirectory);
 
             object sourceValue;
             IEnumerable sourceItems = null;
@@ -201,11 +254,58 @@ namespace ResticBackuper.Dashboard
                 throw new InvalidDataException("The backup configuration contains no source folders.");
             }
 
+            object identitiesValue;
+            IDictionary<string, object> identities =
+                document.TryGetValue("source_identities", out identitiesValue)
+                    ? identitiesValue as IDictionary<string, object>
+                    : null;
+            if (identities == null || identities.Count != sources.Count)
+            {
+                throw new InvalidDataException(
+                    "The backup configuration must identify the volume for every source folder.");
+            }
+            foreach (BackupSourceView source in sources)
+            {
+                string matchingKey = null;
+                int matches = 0;
+                foreach (string identityKey in identities.Keys)
+                {
+                    if (string.Equals(identityKey, source.SourcePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        matchingKey = identityKey;
+                        matches++;
+                    }
+                }
+                if (matches != 1 ||
+                    !string.Equals(matchingKey, source.SourcePath, StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException(
+                        "A source volume identity is missing, duplicated, or non-canonical.");
+                }
+                IDictionary<string, object> identity =
+                    identities[matchingKey] as IDictionary<string, object>;
+                object serialValue;
+                string serial = identity != null &&
+                    identity.TryGetValue("expected_volume_serial", out serialValue)
+                        ? serialValue as string
+                        : null;
+                if (!IsEightHex(serial))
+                {
+                    throw new InvalidDataException(
+                        "A configured source volume identity is invalid.");
+                }
+            }
+
             return new SourceConfiguration
             {
                 InstallRoot = installRoot,
                 ConfigurationPath = configurationPath,
                 ManagerPath = Path.Combine(installRoot, "Manage-Sources.ps1"),
+                RepositoryPath = repositoryPath,
+                StateDirectory = stateDirectory,
+                PlanId = planId,
+                ConfigGeneration = configGeneration,
+                CloudPlaceholderPolicy = cloudPolicy,
                 Sources = sources
             };
         }
@@ -259,6 +359,45 @@ namespace ResticBackuper.Dashboard
             }
             return fullPath;
         }
+
+        private static long ReadPositiveInteger(
+            IDictionary<string, object> document,
+            string name)
+        {
+            object value;
+            if (!document.TryGetValue(name, out value) ||
+                (!(value is int) && !(value is long)))
+            {
+                throw new InvalidDataException(
+                    "The backup configuration contains an invalid " + name + ".");
+            }
+            long parsed = Convert.ToInt64(value, CultureInfo.InvariantCulture);
+            if (parsed <= 0)
+            {
+                throw new InvalidDataException(
+                    "The backup configuration contains an invalid " + name + ".");
+            }
+            return parsed;
+        }
+
+        private static bool IsEightHex(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value.Length != 8)
+            {
+                return false;
+            }
+            foreach (char item in value)
+            {
+                bool isHex = (item >= '0' && item <= '9') ||
+                    (item >= 'a' && item <= 'f') ||
+                    (item >= 'A' && item <= 'F');
+                if (!isHex)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     internal sealed class SourceManagerResult
@@ -266,11 +405,27 @@ namespace ResticBackuper.Dashboard
         public bool Succeeded { get; private set; }
         public bool UserCancelled { get; private set; }
         public int ExitCode { get; private set; }
+        public string PlanId { get; private set; }
+        public long PreviousConfigGeneration { get; private set; }
+        public long ConfigGeneration { get; private set; }
+        public string ChangedPath { get; private set; }
         public string ErrorMessage { get; private set; }
 
-        public static SourceManagerResult Success()
+        public static SourceManagerResult Success(
+            string planId,
+            long previousConfigGeneration,
+            long configGeneration,
+            string changedPath)
         {
-            return new SourceManagerResult { Succeeded = true, ExitCode = 0 };
+            return new SourceManagerResult
+            {
+                Succeeded = true,
+                ExitCode = 0,
+                PlanId = planId,
+                PreviousConfigGeneration = previousConfigGeneration,
+                ConfigGeneration = configGeneration,
+                ChangedPath = changedPath
+            };
         }
 
         public static SourceManagerResult Cancelled()
@@ -287,6 +442,15 @@ namespace ResticBackuper.Dashboard
     internal static class SourceManagerLauncher
     {
         public static SourceManagerResult Run(SourceConfiguration configuration, string action, string sourcePath)
+        {
+            return Run(configuration, action, sourcePath, null);
+        }
+
+        public static SourceManagerResult Run(
+            SourceConfiguration configuration,
+            string action,
+            string sourcePath,
+            Action onElevatedProcessStarted)
         {
             if (configuration == null)
             {
@@ -361,13 +525,32 @@ namespace ResticBackuper.Dashboard
                     {
                         return SourceManagerResult.Failure("Windows did not start the protected source manager.", -1);
                     }
+                    if (onElevatedProcessStarted != null)
+                    {
+                        try
+                        {
+                            onElevatedProcessStarted();
+                        }
+                        catch
+                        {
+                            // Presentation callbacks must never interrupt the protected manager.
+                        }
+                    }
                     process.WaitForExit();
-                    return process.ExitCode == 0
-                        ? SourceManagerResult.Success()
-                        : SourceManagerResult.Failure(
+                    if (process.ExitCode != 0)
+                    {
+                        return SourceManagerResult.Failure(
                             "The protected source manager returned exit code " +
                                 process.ExitCode.ToString(CultureInfo.InvariantCulture) + ".",
                             process.ExitCode);
+                    }
+
+                    SourceConfiguration updated = SourceConfiguration.Load();
+                    return SourceManagerResult.Success(
+                        updated.PlanId,
+                        configuration.ConfigGeneration,
+                        updated.ConfigGeneration,
+                        SourceConfiguration.NormalizePath(sourcePath));
                 }
             }
             catch (Win32Exception error)

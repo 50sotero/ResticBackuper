@@ -144,6 +144,15 @@ namespace ResticBackuper.Dashboard
         public bool IsActive { get; set; }
         public bool IsFailure { get; set; }
         public bool IsSuccess { get; set; }
+        public bool IsCancelled { get; set; }
+        public bool HasMaintenanceHold { get; set; }
+        public bool AnomalyReviewAcknowledged { get; set; }
+        public bool NeedsAnomalyReview
+        {
+            get { return HasMaintenanceHold && !AnomalyReviewAcknowledged; }
+        }
+        public string MaintenanceHoldDetail { get; set; }
+        public string CancelOutcome { get; set; }
         public double Percent { get; set; }
         public bool ProgressIsEstimated { get; set; }
         public string ConfidenceLabel { get; set; }
@@ -160,7 +169,10 @@ namespace ResticBackuper.Dashboard
         public int PhaseIndex { get; set; }
         public string PhaseLabel { get; set; }
         public DateTime LastUpdatedLocal { get; set; }
+        public DateTime? LastVerifiedFinishedUtc { get; set; }
         public string RunId { get; set; }
+        public string SnapshotId { get; set; }
+        public OffsiteStatusView OffsiteStatus { get; set; }
         public IList<RunMetricView> History { get; set; }
 
         public TelemetrySnapshot()
@@ -172,22 +184,93 @@ namespace ResticBackuper.Dashboard
             PhaseIndex = -1;
             PhaseLabel = "Waiting";
             RunId = string.Empty;
+            SnapshotId = string.Empty;
+            CancelOutcome = string.Empty;
+            MaintenanceHoldDetail = string.Empty;
+            OffsiteStatus = new OffsiteStatusView();
             History = new List<RunMetricView>();
+        }
+    }
+
+    public enum OffsiteStatusKind
+    {
+        NotConfigured,
+        StatusUnavailable,
+        Failed,
+        InProgress,
+        LocalVerifiedProviderPending,
+        ProviderConfirmed,
+        RestoreVerified
+    }
+
+    public sealed class OffsiteStatusView
+    {
+        public OffsiteStatusKind Kind { get; internal set; }
+        public string StatusLabel { get; internal set; }
+        public string StatusDetail { get; internal set; }
+        public string PlanId { get; internal set; }
+        public long ConfigGeneration { get; internal set; }
+        public string RepositoryId { get; internal set; }
+        public string RepositoryPath { get; internal set; }
+        public string SnapshotId { get; internal set; }
+        public string InventoryFingerprintSha256 { get; internal set; }
+        public long FileCount { get; internal set; }
+        public long ByteCount { get; internal set; }
+        public DateTime? LastUpdatedLocal { get; internal set; }
+        public bool ProviderUploadConfirmed { get; internal set; }
+        public bool RestoreVerified { get; internal set; }
+
+        public string SnapshotShort
+        {
+            get
+            {
+                return string.IsNullOrEmpty(SnapshotId)
+                    ? string.Empty
+                    : SnapshotId.Substring(0, Math.Min(8, SnapshotId.Length));
+            }
+        }
+
+        public OffsiteStatusView()
+        {
+            Kind = OffsiteStatusKind.NotConfigured;
+            StatusLabel = "Cloud verification not configured";
+            StatusDetail =
+                "No direct Google Drive repository verification has been recorded.";
+            PlanId = string.Empty;
+            ConfigGeneration = -1;
+            RepositoryId = string.Empty;
+            RepositoryPath = string.Empty;
+            SnapshotId = string.Empty;
+            InventoryFingerprintSha256 = string.Empty;
+            FileCount = -1;
+            ByteCount = -1;
         }
     }
 
     public sealed class TelemetryReader
     {
         private const int MaximumJsonLength = 32 * 1024 * 1024;
+        private const int MaximumOffsiteJsonLength = 1024 * 1024;
         private const int MaximumHistoryRuns = 400;
         private const int MaximumLiveSamples = 20000;
         private const double MaximumEtaSeconds = 14.0 * 24.0 * 60.0 * 60.0;
         private const double MissingProcessGraceSeconds = 120.0;
         private const double MaximumActiveStatusAgeSeconds = 24.0 * 60.0 * 60.0;
+        private const string DirectCloudProofKind =
+            "direct_my_drive_cloud_repository_verification";
+        private const string DirectCloudVerificationMode =
+            "google_drive_api_readonly_rclone_backend";
+        private const string PostActivationVerificationPhase = "post_activation";
+        private const string DriveFsStorageMode = "google_drivefs_stream";
 
         private readonly string stateDirectory;
         private readonly string statusPath;
         private readonly string dryRunLatestPath;
+        private readonly string lastSuccessPath;
+        private readonly string anomalyAcknowledgementPath;
+        private readonly string protectedOffsiteStatusPath;
+        private readonly string directCloudVerificationPath;
+        private readonly string legacyLocalOffsiteStatusPath;
         private readonly bool allowPersistence;
         private readonly string dashboardDirectory;
         private readonly string historyPath;
@@ -201,6 +284,14 @@ namespace ResticBackuper.Dashboard
         private List<LiveSampleRecord> liveSamples = new List<LiveSampleRecord>();
 
         public TelemetryReader(string stateDirectory, bool allowPersistence)
+            : this(stateDirectory, allowPersistence, null)
+        {
+        }
+
+        internal TelemetryReader(
+            string stateDirectory,
+            bool allowPersistence,
+            string localOffsiteStatusPathOverride)
         {
             if (string.IsNullOrWhiteSpace(stateDirectory))
             {
@@ -214,10 +305,43 @@ namespace ResticBackuper.Dashboard
             this.stateDirectory = TrimTrailingSeparators(Path.GetFullPath(stateDirectory));
             this.statusPath = Path.Combine(this.stateDirectory, "status.json");
             this.dryRunLatestPath = Path.Combine(this.stateDirectory, "dry-run-latest.json");
+            this.lastSuccessPath = Path.Combine(this.stateDirectory, "last-success.json");
+            this.anomalyAcknowledgementPath = Path.Combine(
+                this.stateDirectory,
+                "anomaly-acknowledgement.json");
+            this.protectedOffsiteStatusPath = Path.Combine(
+                this.stateDirectory,
+                "google-drive-sync-status.json");
             this.allowPersistence = allowPersistence;
 
             string localApplicationData = Environment.GetFolderPath(
                 Environment.SpecialFolder.LocalApplicationData);
+            string commonApplicationData = Environment.GetFolderPath(
+                Environment.SpecialFolder.CommonApplicationData);
+            if (!string.IsNullOrWhiteSpace(localOffsiteStatusPathOverride)
+                && !Path.IsPathRooted(localOffsiteStatusPathOverride))
+            {
+                throw new ArgumentException(
+                    "The off-site status override must be absolute.",
+                    "localOffsiteStatusPathOverride");
+            }
+            this.directCloudVerificationPath =
+                !string.IsNullOrWhiteSpace(localOffsiteStatusPathOverride)
+                    ? Path.GetFullPath(localOffsiteStatusPathOverride)
+                    : string.IsNullOrWhiteSpace(commonApplicationData)
+                        ? string.Empty
+                        : Path.Combine(
+                            commonApplicationData,
+                            "ResticBackuperCloudVerification",
+                            "evidence",
+                            "latest-verification.json");
+            this.legacyLocalOffsiteStatusPath = string.IsNullOrWhiteSpace(
+                localApplicationData)
+                ? string.Empty
+                : Path.Combine(
+                    localApplicationData,
+                    "ResticBackuperGoogleDriveSync",
+                    "status.json");
             this.dashboardDirectory = string.IsNullOrWhiteSpace(localApplicationData)
                 ? string.Empty
                 : Path.Combine(localApplicationData, "ResticBackuperDashboard");
@@ -246,6 +370,10 @@ namespace ResticBackuper.Dashboard
 
                 JsonReadResult statusRead = ReadJsonObject(statusPath);
                 JsonReadResult dryRunRead = ReadJsonObject(dryRunLatestPath);
+                JsonReadResult lastSuccessRead = ReadJsonObject(lastSuccessPath);
+                JsonReadResult anomalyAcknowledgementRead = ReadJsonObject(
+                    anomalyAcknowledgementPath);
+                JsonReadResult offsiteStatusRead = ReadPreferredOffsiteStatus();
                 bool historyChanged = false;
 
                 if (dryRunRead.Document != null)
@@ -266,6 +394,21 @@ namespace ResticBackuper.Dashboard
                 }
 
                 TelemetrySnapshot snapshot = BuildSnapshot(statusRead, dryRunRead);
+                snapshot.OffsiteStatus = BuildOffsiteStatus(
+                    offsiteStatusRead,
+                    statusRead.Document,
+                    lastSuccessRead.Document);
+                ApplyAnomalyAcknowledgement(
+                    snapshot,
+                    statusRead.Document,
+                    lastSuccessRead,
+                    anomalyAcknowledgementRead.Document);
+                DateTime lastVerifiedFinishedUtc;
+                snapshot.LastVerifiedFinishedUtc = TryReadLastVerifiedFinishedUtc(
+                    lastSuccessRead.Document,
+                    out lastVerifiedFinishedUtc)
+                    ? lastVerifiedFinishedUtc
+                    : (DateTime?)null;
                 snapshot.History = BuildHistoryViews();
 
                 bool samplesChanged = CaptureLiveSample(snapshot);
@@ -288,6 +431,10 @@ namespace ResticBackuper.Dashboard
             {
                 JsonReadResult statusRead = ReadJsonObject(statusPath);
                 JsonReadResult dryRunRead = ReadJsonObject(dryRunLatestPath);
+                JsonReadResult lastSuccessRead = ReadJsonObject(lastSuccessPath);
+                JsonReadResult anomalyAcknowledgementRead = ReadJsonObject(
+                    anomalyAcknowledgementPath);
+                JsonReadResult offsiteStatusRead = ReadPreferredOffsiteStatus();
                 JsonReadResult historyRead = string.IsNullOrEmpty(historyPath)
                     ? JsonReadResult.Missing()
                     : ReadJsonObject(historyPath);
@@ -296,12 +443,18 @@ namespace ResticBackuper.Dashboard
                     : ReadJsonObject(liveSamplesPath);
 
                 bool protectedTelemetryAvailable = statusRead.Document != null
-                    || dryRunRead.Document != null;
+                    || dryRunRead.Document != null
+                    || lastSuccessRead.Document != null;
+                DateTime lastVerifiedFinishedUtc;
+                bool lastSuccessSemanticallyValid = TryReadLastVerifiedFinishedUtc(
+                    lastSuccessRead.Document,
+                    out lastVerifiedFinishedUtc);
                 bool protectedTelemetryValid = (!statusRead.Exists || statusRead.Document != null)
-                    && (!dryRunRead.Exists || dryRunRead.Document != null);
+                    && (!dryRunRead.Exists || dryRunRead.Document != null)
+                    && (!lastSuccessRead.Exists || lastSuccessSemanticallyValid);
 
                 Dictionary<string, object> result = new Dictionary<string, object>();
-                result["schema_version"] = 1;
+                result["schema_version"] = 2;
                 result["ok"] = Directory.Exists(stateDirectory)
                     && protectedTelemetryAvailable
                     && protectedTelemetryValid;
@@ -309,10 +462,38 @@ namespace ResticBackuper.Dashboard
                 result["state_directory"] = stateDirectory;
                 result["state_directory_exists"] = Directory.Exists(stateDirectory);
                 result["allowed_protected_files"] = new string[] {
-                    "status.json", "dry-run-latest.json"
+                    "status.json", "dry-run-latest.json", "last-success.json",
+                    "anomaly-acknowledgement.json", "google-drive-sync-status.json"
                 };
                 result["status"] = SelfTestFileResult(statusRead);
                 result["dry_run_latest"] = SelfTestFileResult(dryRunRead);
+                Dictionary<string, object> lastSuccessResult = SelfTestFileResult(lastSuccessRead);
+                lastSuccessResult["verified_success_record"] = lastSuccessSemanticallyValid;
+                lastSuccessResult["verified_finished_utc"] = lastSuccessSemanticallyValid
+                    ? FormatUtc(lastVerifiedFinishedUtc)
+                    : null;
+                result["last_success"] = lastSuccessResult;
+                result["anomaly_acknowledgement"] = SelfTestFileResult(
+                    anomalyAcknowledgementRead);
+                result["offsite_status"] = SelfTestFileResult(offsiteStatusRead);
+                OffsiteStatusView offsite = BuildOffsiteStatus(
+                    offsiteStatusRead,
+                    statusRead.Document,
+                    lastSuccessRead.Document);
+                result["offsite_model"] = new Dictionary<string, object>
+                {
+                    { "kind", offsite.Kind.ToString() },
+                    { "provider_upload_confirmed", offsite.ProviderUploadConfirmed },
+                    { "restore_verified", offsite.RestoreVerified },
+                    { "plan_id", offsite.PlanId },
+                    { "config_generation", offsite.ConfigGeneration },
+                    { "repository_id", offsite.RepositoryId },
+                    { "repository_path", offsite.RepositoryPath },
+                    { "snapshot_id", offsite.SnapshotId },
+                    { "inventory_fingerprint_sha256", offsite.InventoryFingerprintSha256 },
+                    { "files", offsite.FileCount },
+                    { "bytes", offsite.ByteCount }
+                };
                 result["local_history"] = SelfTestFileResult(historyRead);
                 result["local_live_samples"] = SelfTestFileResult(samplesRead);
                 result["persistence_configured"] = allowPersistence;
@@ -442,6 +623,569 @@ namespace ResticBackuper.Dashboard
             return waiting;
         }
 
+        private JsonReadResult ReadPreferredOffsiteStatus()
+        {
+            JsonReadResult directCloudProof = ReadJsonObject(
+                directCloudVerificationPath,
+                MaximumOffsiteJsonLength);
+            if (directCloudProof.Exists)
+            {
+                return directCloudProof;
+            }
+
+            JsonReadResult protectedStatus = ReadJsonObject(
+                protectedOffsiteStatusPath,
+                MaximumOffsiteJsonLength);
+            if (protectedStatus.Exists)
+            {
+                return protectedStatus;
+            }
+            return ReadJsonObject(
+                legacyLocalOffsiteStatusPath,
+                MaximumOffsiteJsonLength);
+        }
+
+        private OffsiteStatusView BuildOffsiteStatus(
+            JsonReadResult read,
+            IDictionary<string, object> currentStatus,
+            IDictionary<string, object> lastSuccess)
+        {
+            OffsiteStatusView result = new OffsiteStatusView();
+            if (!read.Exists)
+            {
+                return result;
+            }
+            if (read.Document == null)
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Off-site status unavailable";
+                result.StatusDetail = CleanOffsiteDetail(read.Error);
+                return result;
+            }
+
+            IDictionary<string, object> document = read.Document;
+            long schemaVersion = GetLong(document, "schema_version", -1);
+            string proofKind = GetString(document, "proof_kind", string.Empty);
+            if (schemaVersion != 2
+                || !string.Equals(
+                    proofKind,
+                    DirectCloudProofKind,
+                    StringComparison.Ordinal))
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Direct cloud verification required";
+                result.StatusDetail =
+                    "Legacy local-mirror evidence is retired and cannot prove the streamed Google Drive repository is available in the cloud.";
+                return result;
+            }
+            if (!string.Equals(
+                    GetString(document, "verification_phase", string.Empty),
+                    PostActivationVerificationPhase,
+                    StringComparison.Ordinal))
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Post-activation cloud verification required";
+                result.StatusDetail =
+                    "Pre-activation or unclassified evidence is not current off-site protection status.";
+                return result;
+            }
+
+            string state = GetString(document, "state", string.Empty)
+                .Trim()
+                .ToLowerInvariant();
+
+            DateTime updatedUtc;
+            if (TryGetUtc(document, "verified_utc", out updatedUtc))
+            {
+                result.LastUpdatedLocal = updatedUtc.ToLocalTime();
+            }
+            else if (read.LastWriteUtc != DateTime.MinValue)
+            {
+                result.LastUpdatedLocal = read.LastWriteUtc.ToLocalTime();
+            }
+
+            string statusMessage = GetString(document, "message", string.Empty);
+            string errorMessage = GetString(document, "error", string.Empty);
+            if (state == "failed")
+            {
+                result.Kind = OffsiteStatusKind.Failed;
+                result.StatusLabel = "Direct cloud verification failed";
+                result.StatusDetail = CleanOffsiteDetail(
+                    string.IsNullOrWhiteSpace(errorMessage)
+                        ? statusMessage
+                        : errorMessage);
+                return result;
+            }
+
+            if (state == "starting" || state == "waiting" || state == "copying"
+                || state == "verifying" || state == "uploading"
+                || state == "committing" || state == "restoring")
+            {
+                result.Kind = OffsiteStatusKind.InProgress;
+                result.StatusLabel = state == "restoring"
+                    ? "Direct cloud restore verification in progress"
+                    : "Google Drive repository verification in progress";
+                result.StatusDetail = CleanOffsiteDetail(statusMessage);
+                return result;
+            }
+
+            if (state != "verified")
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Off-site status unavailable";
+                result.StatusDetail =
+                    "The direct-cloud proof contains an unrecognized state.";
+                return result;
+            }
+
+            string verificationMode = GetString(
+                document,
+                "verification_mode",
+                string.Empty);
+            string storageMode = GetString(
+                document,
+                "repository_storage_mode",
+                string.Empty);
+            string localRepository = CanonicalWindowsPath(
+                GetString(document, "local_repository", string.Empty));
+            string myDriveRoot = CanonicalWindowsPath(
+                GetString(document, "my_drive_root", string.Empty));
+            string cloudRootFolderId = GetString(
+                document,
+                "cloud_root_folder_id",
+                string.Empty);
+            string cloudRepositoryPath = GetString(
+                document,
+                "cloud_repository_path",
+                string.Empty);
+            string planId = CanonicalPlanId(
+                GetString(document, "plan_id", string.Empty));
+            long configGeneration = -1;
+            string repositoryId = CanonicalSnapshotId(
+                GetString(document, "repository_id", string.Empty));
+            string localRepositoryId = CanonicalSnapshotId(
+                GetString(document, "local_repository_id", string.Empty));
+            string cloudRepositoryId = CanonicalSnapshotId(
+                GetString(document, "cloud_repository_id", string.Empty));
+            string snapshotId = CanonicalSnapshotId(
+                GetString(document, "snapshot_id", string.Empty));
+            string inventoryFingerprint = CanonicalSnapshotId(
+                GetString(
+                    document,
+                    "inventory_fingerprint_sha256",
+                    string.Empty));
+            string cloudInventoryHash = CanonicalSnapshotId(
+                GetString(
+                    document,
+                    "cloud_inventory_document_sha256",
+                    string.Empty));
+            string backupConfigHash = CanonicalSnapshotId(
+                GetString(document, "backup_config_sha256", string.Empty));
+            string immutableProofHash = CanonicalSnapshotId(
+                GetString(document, "immutable_proof_sha256", string.Empty));
+            string cloudAssetsManifestHash = CanonicalSnapshotId(
+                GetString(
+                    document,
+                    "cloud_verification_assets_manifest_sha256",
+                    string.Empty));
+            string canaryHash = CanonicalSnapshotId(
+                GetString(document, "canary_sha256", string.Empty));
+            long files = -1;
+            long bytes = -1;
+            long missingFiles = -1;
+            long extraFiles = -1;
+            long mismatchedFiles = -1;
+            long cloudObjectsWithIds = -1;
+            long canaryBytes = -1;
+            bool typedInventory =
+                TryGetJsonInteger(document, "config_generation", 1, out configGeneration)
+                && TryGetJsonInteger(document, "files", 1, out files)
+                && TryGetJsonInteger(document, "bytes", 1, out bytes)
+                && TryGetJsonInteger(document, "missing_files", 0, out missingFiles)
+                && TryGetJsonInteger(document, "extra_files", 0, out extraFiles)
+                && TryGetJsonInteger(
+                    document,
+                    "mismatched_files",
+                    0,
+                    out mismatchedFiles)
+                && TryGetJsonInteger(
+                    document,
+                    "cloud_objects_with_ids",
+                    1,
+                    out cloudObjectsWithIds)
+                && TryGetJsonInteger(
+                    document,
+                    "canary_bytes",
+                    0,
+                    out canaryBytes);
+            string expectedCloudPath = CloudPathForLocalRepository(
+                localRepository,
+                myDriveRoot);
+            bool exactPathBinding =
+                !string.IsNullOrEmpty(expectedCloudPath)
+                && string.Equals(
+                    cloudRootFolderId,
+                    "root",
+                    StringComparison.Ordinal)
+                && string.Equals(
+                    cloudRepositoryPath,
+                    expectedCloudPath,
+                    StringComparison.Ordinal);
+            bool identityBinding =
+                !string.IsNullOrEmpty(repositoryId)
+                && repositoryId == localRepositoryId
+                && repositoryId == cloudRepositoryId;
+            bool inventoryBinding =
+                typedInventory
+                && files > 0
+                && bytes > 0
+                && missingFiles == 0
+                && extraFiles == 0
+                && mismatchedFiles == 0
+                && cloudObjectsWithIds == files
+                && GetBool(document, "repository_identity_verified", false)
+                && GetBool(document, "exact_file_inventory_verified", false)
+                && GetBool(
+                    document,
+                    "path_case_size_md5_sha256_verified",
+                    false)
+                && !string.IsNullOrEmpty(inventoryFingerprint)
+                && !string.IsNullOrEmpty(cloudInventoryHash)
+                && !string.IsNullOrEmpty(backupConfigHash)
+                && !string.IsNullOrEmpty(immutableProofHash)
+                && !string.IsNullOrEmpty(cloudAssetsManifestHash)
+                && string.Equals(
+                    GetString(document, "native_capture_mode", string.Empty),
+                    "binary_stream_copy",
+                    StringComparison.Ordinal);
+            bool restoreBinding =
+                GetBool(document, "direct_cloud_restore_verified", false)
+                && string.Equals(
+                    GetString(
+                        document,
+                        "provider_upload_state",
+                        string.Empty),
+                    "fully_synced",
+                    StringComparison.Ordinal)
+                && string.Equals(
+                    GetString(
+                        document,
+                        "restore_verification_state",
+                        string.Empty),
+                    "verified",
+                    StringComparison.Ordinal)
+                && !string.IsNullOrEmpty(canaryHash)
+                && canaryBytes >= 0;
+
+            if (!string.Equals(
+                    verificationMode,
+                    DirectCloudVerificationMode,
+                    StringComparison.Ordinal)
+                || !string.Equals(
+                    storageMode,
+                    DriveFsStorageMode,
+                    StringComparison.Ordinal)
+                || string.IsNullOrEmpty(planId)
+                || string.IsNullOrEmpty(snapshotId)
+                || !exactPathBinding
+                || !identityBinding
+                || !inventoryBinding
+                || !restoreBinding)
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Direct cloud verification incomplete";
+                result.StatusDetail =
+                    "The latest proof lacks a complete My Drive path, repository identity, inventory, immutable-evidence, or direct-restore binding.";
+                return result;
+            }
+
+            DateTime verifiedUtc;
+            if (!TryGetUtc(document, "verified_utc", out verifiedUtc))
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Direct cloud verification incomplete";
+                result.StatusDetail =
+                    "The latest proof has no valid verification timestamp.";
+                return result;
+            }
+
+            DateTime lastSuccessFinishedUtc;
+            if (!TryReadLastVerifiedFinishedUtc(
+                    lastSuccess,
+                    out lastSuccessFinishedUtc)
+                || !BackupBindingMatches(
+                    lastSuccess,
+                    planId,
+                    configGeneration,
+                    localRepository,
+                    repositoryId,
+                    snapshotId,
+                    true))
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Direct cloud proof is stale";
+                result.StatusDetail =
+                    "The proof does not match the latest successfully verified backup plan, generation, repository, and snapshot.";
+                return result;
+            }
+
+            if (currentStatus != null
+                && !BackupBindingMatches(
+                    currentStatus,
+                    planId,
+                    configGeneration,
+                    localRepository,
+                    repositoryId,
+                    snapshotId,
+                    false))
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Direct cloud proof is stale";
+                result.StatusDetail =
+                    "The proof does not match the repository plan or generation in current protected backup telemetry.";
+                return result;
+            }
+
+            DateTime currentTelemetryUtc;
+            bool currentHasTimestamp = TryGetUtc(
+                currentStatus,
+                "finished_utc",
+                out currentTelemetryUtc)
+                || TryGetUtc(
+                    currentStatus,
+                    "started_utc",
+                    out currentTelemetryUtc);
+            if (verifiedUtc < lastSuccessFinishedUtc
+                || (currentHasTimestamp && verifiedUtc < currentTelemetryUtc))
+            {
+                result.Kind = OffsiteStatusKind.StatusUnavailable;
+                result.StatusLabel = "Direct cloud proof is stale";
+                result.StatusDetail =
+                    "The cloud verification predates the latest repository-changing backup attempt or successful backup.";
+                return result;
+            }
+
+            result.PlanId = planId;
+            result.ConfigGeneration = configGeneration;
+            result.RepositoryId = repositoryId;
+            result.RepositoryPath = localRepository;
+            result.SnapshotId = snapshotId;
+            result.InventoryFingerprintSha256 = inventoryFingerprint;
+            result.FileCount = files;
+            result.ByteCount = bytes;
+            result.LastUpdatedLocal = verifiedUtc.ToLocalTime();
+            result.ProviderUploadConfirmed = true;
+            result.RestoreVerified = true;
+            result.Kind = OffsiteStatusKind.RestoreVerified;
+            result.StatusLabel = "Google Drive repository verified";
+            result.StatusDetail =
+                "The live streamed repository matches Google Drive's API inventory, and an independent direct-cloud restore succeeded.";
+            return result;
+        }
+
+        private static bool BackupBindingMatches(
+            IDictionary<string, object> document,
+            string planId,
+            long configGeneration,
+            string repositoryPath,
+            string repositoryId,
+            string snapshotId,
+            bool requireSnapshot)
+        {
+            if (document == null)
+            {
+                return false;
+            }
+            long recordedGeneration;
+            if (CanonicalPlanId(GetString(document, "plan_id", string.Empty))
+                    != planId
+                || !TryGetJsonInteger(
+                    document,
+                    "config_generation",
+                    1,
+                    out recordedGeneration)
+                || recordedGeneration != configGeneration
+                || !string.Equals(
+                    CanonicalWindowsPath(
+                        GetString(document, "repository", string.Empty)),
+                    repositoryPath,
+                    StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(
+                    GetString(
+                        document,
+                        "repository_storage_mode",
+                        string.Empty),
+                    DriveFsStorageMode,
+                    StringComparison.Ordinal)
+                || CanonicalSnapshotId(
+                    GetString(document, "repository_id", string.Empty))
+                    != repositoryId)
+            {
+                return false;
+            }
+            if (!requireSnapshot)
+            {
+                string currentSnapshot = CanonicalSnapshotId(
+                    GetString(document, "snapshot_id", string.Empty));
+                return string.IsNullOrEmpty(currentSnapshot)
+                    || currentSnapshot == snapshotId;
+            }
+            return CanonicalSnapshotId(
+                GetString(document, "snapshot_id", string.Empty)) == snapshotId;
+        }
+
+        private static bool TryGetJsonInteger(
+            IDictionary<string, object> source,
+            string key,
+            long minimum,
+            out long result)
+        {
+            result = -1;
+            if (source == null)
+            {
+                return false;
+            }
+            object value;
+            if (!source.TryGetValue(key, out value)
+                || value == null
+                || value is bool
+                || value is string)
+            {
+                return false;
+            }
+            try
+            {
+                if (value is double)
+                {
+                    double number = (double)value;
+                    if (double.IsNaN(number)
+                        || double.IsInfinity(number)
+                        || Math.Truncate(number) != number
+                        || number > long.MaxValue
+                        || number < minimum)
+                    {
+                        return false;
+                    }
+                }
+                if (value is decimal)
+                {
+                    decimal number = (decimal)value;
+                    if (decimal.Truncate(number) != number
+                        || number > long.MaxValue
+                        || number < minimum)
+                    {
+                        return false;
+                    }
+                }
+                result = Convert.ToInt64(value, CultureInfo.InvariantCulture);
+                return result >= minimum;
+            }
+            catch (Exception error)
+            {
+                if (error is FormatException
+                    || error is InvalidCastException
+                    || error is OverflowException)
+                {
+                    return false;
+                }
+                throw;
+            }
+        }
+
+        private static string CanonicalPlanId(string value)
+        {
+            Guid parsed;
+            if (!Guid.TryParse(value, out parsed) || parsed == Guid.Empty)
+            {
+                return string.Empty;
+            }
+            string canonical = parsed.ToString("D");
+            return string.Equals(value, canonical, StringComparison.Ordinal)
+                ? canonical
+                : string.Empty;
+        }
+
+        private static string CanonicalWindowsPath(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || !Path.IsPathRooted(value))
+            {
+                return string.Empty;
+            }
+            try
+            {
+                return TrimTrailingSeparators(Path.GetFullPath(value));
+            }
+            catch (Exception error)
+            {
+                if (error is ArgumentException
+                    || error is NotSupportedException
+                    || error is PathTooLongException)
+                {
+                    return string.Empty;
+                }
+                throw;
+            }
+        }
+
+        private static string CloudPathForLocalRepository(
+            string repository,
+            string myDriveRoot)
+        {
+            if (string.IsNullOrEmpty(repository)
+                || string.IsNullOrEmpty(myDriveRoot)
+                || !repository.StartsWith(
+                    myDriveRoot + Path.DirectorySeparatorChar,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return string.Empty;
+            }
+            string relative = repository.Substring(myDriveRoot.Length)
+                .TrimStart(Path.DirectorySeparatorChar)
+                .Replace(Path.DirectorySeparatorChar, '/');
+            if (string.IsNullOrEmpty(relative)
+                || relative.StartsWith("/", StringComparison.Ordinal)
+                || relative.EndsWith("/", StringComparison.Ordinal)
+                || relative.Split('/').Any(part =>
+                    string.IsNullOrEmpty(part)
+                    || part == "."
+                    || part == ".."))
+            {
+                return string.Empty;
+            }
+            return relative;
+        }
+
+        private static string CanonicalSnapshotId(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value) || value.Length != 64)
+            {
+                return string.Empty;
+            }
+            foreach (char item in value)
+            {
+                if (!((item >= '0' && item <= '9')
+                    || (item >= 'a' && item <= 'f')
+                    || (item >= 'A' && item <= 'F')))
+                {
+                    return string.Empty;
+                }
+            }
+            return value.ToLowerInvariant();
+        }
+
+        private static string CleanOffsiteDetail(string value)
+        {
+            if (!string.IsNullOrEmpty(value)
+                && (value.IndexOf("password", StringComparison.OrdinalIgnoreCase) >= 0
+                    || value.IndexOf("dpapi", StringComparison.OrdinalIgnoreCase) >= 0
+                    || value.IndexOf("RESTIC_", StringComparison.OrdinalIgnoreCase) >= 0
+                    || value.IndexOf("recovery key", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                return "Off-site status needs attention without exposing credential details.";
+            }
+            return CleanDisplayText(value, 320);
+        }
+
         private TelemetrySnapshot BuildTelemetryError(
             string label,
             string detail,
@@ -480,6 +1224,7 @@ namespace ResticBackuper.Dashboard
 
             TelemetrySnapshot snapshot = new TelemetrySnapshot();
             snapshot.RunId = GetString(document, "run_id", string.Empty);
+            snapshot.SnapshotId = GetString(document, "snapshot_id", string.Empty);
             snapshot.FilesDone = Math.Max(0, files);
             snapshot.EstimatedFiles = Math.Max(0, files);
             snapshot.BytesDone = Math.Max(0, bytes);
@@ -523,6 +1268,69 @@ namespace ResticBackuper.Dashboard
             return snapshot;
         }
 
+        private static void ApplyAnomalyAcknowledgement(
+            TelemetrySnapshot snapshot,
+            IDictionary<string, object> status,
+            JsonReadResult lastSuccessRead,
+            IDictionary<string, object> acknowledgement)
+        {
+            if (snapshot == null || !snapshot.HasMaintenanceHold ||
+                status == null || lastSuccessRead == null ||
+                lastSuccessRead.Document == null || acknowledgement == null)
+            {
+                return;
+            }
+            IDictionary<string, object> evidence = lastSuccessRead.Document;
+            IEnumerable<string> scopes = GetCollection(acknowledgement, "scope")
+                .Select(item => Convert.ToString(item, CultureInfo.InvariantCulture));
+            bool exact = GetString(acknowledgement, "schema", string.Empty)
+                    == "ResticBackuper.AnomalyReview.v1"
+                && GetLong(acknowledgement, "schema_version", 0) == 1
+                && GetString(acknowledgement, "decision", string.Empty) == "approved"
+                && GetBool(acknowledgement, "maintenance_hold_remains", false)
+                && (scopes.Contains(
+                        "anomaly_review_acknowledgement",
+                        StringComparer.Ordinal)
+                    || scopes.Contains(
+                        "offsite_promotion",
+                        StringComparer.Ordinal))
+                && GetString(acknowledgement, "plan_id", string.Empty)
+                    == GetString(status, "plan_id", string.Empty)
+                && GetLong(acknowledgement, "config_generation", -1)
+                    == GetLong(status, "config_generation", -2)
+                && GetString(acknowledgement, "repository_id", string.Empty)
+                    == GetString(status, "repository_id", string.Empty)
+                && GetString(acknowledgement, "run_id", string.Empty)
+                    == GetString(status, "run_id", string.Empty)
+                && GetString(acknowledgement, "snapshot_id", string.Empty)
+                    == GetString(status, "snapshot_id", string.Empty)
+                && (GetString(evidence, "state", string.Empty) == "success"
+                    || GetString(evidence, "state", string.Empty) == "success_unchanged")
+                && GetBool(evidence, "verification_complete", false)
+                && GetBool(evidence, "maintenance_hold", false)
+                && GetString(evidence, "plan_id", string.Empty)
+                    == GetString(status, "plan_id", string.Empty)
+                && GetLong(evidence, "config_generation", -1)
+                    == GetLong(status, "config_generation", -2)
+                && GetString(evidence, "repository_id", string.Empty)
+                    == GetString(status, "repository_id", string.Empty)
+                && GetString(evidence, "run_id", string.Empty)
+                    == GetString(status, "run_id", string.Empty)
+                && GetString(evidence, "snapshot_id", string.Empty)
+                    == GetString(status, "snapshot_id", string.Empty)
+                && !string.IsNullOrEmpty(lastSuccessRead.Sha256)
+                && GetString(acknowledgement, "backup_evidence_sha256", string.Empty)
+                    == lastSuccessRead.Sha256;
+            if (!exact)
+            {
+                return;
+            }
+            snapshot.AnomalyReviewAcknowledged = true;
+            snapshot.StatusLabel = "Backup verified — changes acknowledged";
+            snapshot.StatusDetail = "The suspicious change set was explicitly reviewed for this exact generation. The maintenance hold remains for any future deletion or retention action; DriveFS upload is not paused.";
+            snapshot.PhaseLabel = "Reviewed";
+        }
+
         private TelemetrySnapshot BuildBackupSnapshot(
             IDictionary<string, object> document,
             DateTime lastWriteUtc)
@@ -531,11 +1339,16 @@ namespace ResticBackuper.Dashboard
             IDictionary<string, object> progress = GetDictionary(document, "progress");
             IDictionary<string, object> summary = GetDictionary(document, "summary");
             bool terminalSuccess = state == "success" || state == "success_unchanged";
-            bool recordedTerminalFailure = state == "failed" || state == "partial";
+            bool terminalCancelled = state == "cancelled";
+            bool recordedTerminalFailure = state == "failed" || state == "partial"
+                || state == "cancel_failed";
+            string phaseState = (state == "cancelling" || terminalCancelled)
+                ? GetString(document, "phase_at_cancel_request", "backing_up").ToLowerInvariant()
+                : state;
             PhaseInfo phase = recordedTerminalFailure
                 ? InferFailurePhase(document, state)
-                : GetPhase(state);
-            bool active = !terminalSuccess && !recordedTerminalFailure
+                : GetPhase(phaseState);
+            bool active = !terminalSuccess && !terminalCancelled && !recordedTerminalFailure
                 && state != "unknown" && state != "waiting";
 
             DateTime startedUtc;
@@ -565,10 +1378,10 @@ namespace ResticBackuper.Dashboard
             long progressBytes = Math.Max(0, GetLong(progress, "bytes_done", 0));
             long summaryFiles = Math.Max(0, GetLong(summary, "total_files_processed", 0));
             long summaryBytes = Math.Max(0, GetLong(summary, "total_bytes_processed", 0));
-            long filesDone = terminalSuccess || terminalFailure
+            long filesDone = terminalSuccess || terminalCancelled || terminalFailure
                 ? Math.Max(progressFiles, summaryFiles)
                 : progressFiles;
-            long bytesDone = terminalSuccess || terminalFailure
+            long bytesDone = terminalSuccess || terminalCancelled || terminalFailure
                 ? Math.Max(progressBytes, summaryBytes)
                 : progressBytes;
 
@@ -633,14 +1446,41 @@ namespace ResticBackuper.Dashboard
                         : 0;
                 }
             }
-            backupFraction = Clamp(backupFraction, 0, active || interrupted ? 0.985 : 1);
+            if (!exactProgress && baseline.UsesComparableRuns)
+            {
+                double comparableExpectedSeconds = ComparableExpectedResticSeconds(
+                    baseline,
+                    filesDone,
+                    bytesDone,
+                    elapsedForRate);
+                backupFraction = comparableExpectedSeconds > 0
+                    ? elapsedForRate / comparableExpectedSeconds
+                    : 0;
+            }
+            backupFraction = Clamp(
+                backupFraction,
+                0,
+                active || interrupted || terminalCancelled ? 0.985 : 1);
 
             TelemetrySnapshot snapshot = new TelemetrySnapshot();
             snapshot.StateKey = state;
-            snapshot.StatusLabel = interrupted ? "Backup appears interrupted" : phase.StatusLabel;
+            snapshot.StatusLabel = interrupted
+                ? "Backup appears interrupted"
+                : state == "cancelling"
+                    ? "Canceling backup safely"
+                    : phase.StatusLabel;
             snapshot.IsActive = active;
             snapshot.IsFailure = terminalFailure;
             snapshot.IsSuccess = terminalSuccess;
+            snapshot.IsCancelled = terminalCancelled;
+            snapshot.HasMaintenanceHold = terminalSuccess
+                && GetBool(document, "maintenance_hold", false);
+            snapshot.MaintenanceHoldDetail = snapshot.HasMaintenanceHold
+                ? BuildChangeAnomalyDetail(document)
+                : string.Empty;
+            snapshot.CancelOutcome = CleanIdentifier(
+                GetString(document, "cancel_outcome", string.Empty),
+                100);
             snapshot.FilesDone = filesDone;
             snapshot.EstimatedFiles = Math.Max(0, estimatedFiles);
             snapshot.BytesDone = bytesDone;
@@ -657,12 +1497,26 @@ namespace ResticBackuper.Dashboard
             snapshot.PhaseLabel = phase.PhaseLabel;
             snapshot.LastUpdatedLocal = ToLocalOrNow(lastWriteUtc);
             snapshot.RunId = GetString(document, "run_id", string.Empty);
+            snapshot.SnapshotId = GetString(document, "snapshot_id", string.Empty);
+            if (snapshot.HasMaintenanceHold)
+            {
+                snapshot.StatusLabel = "Backup verified — review changes";
+                snapshot.PhaseLabel = "Review changes";
+            }
 
             if (terminalSuccess)
             {
                 snapshot.Percent = 1;
                 snapshot.ProgressIsEstimated = false;
                 snapshot.ConfidenceLabel = "Final run result";
+            }
+            else if (terminalCancelled)
+            {
+                snapshot.Percent = OverallPercent(phase.Stage, backupFraction);
+                snapshot.ProgressIsEstimated = true;
+                snapshot.ConfidenceLabel = "Progress when cancellation completed";
+                snapshot.PhaseLabel = "Canceled";
+                snapshot.StatusLabel = "Backup canceled";
             }
             else if (terminalFailure)
             {
@@ -710,6 +1564,10 @@ namespace ResticBackuper.Dashboard
             TelemetrySnapshot snapshot,
             IDictionary<string, object> document)
         {
+            if (snapshot.HasMaintenanceHold)
+            {
+                return snapshot.MaintenanceHoldDetail;
+            }
             if (snapshot.StateKey == "interrupted")
             {
                 return "The protected status stopped updating and its backup process is no longer running or no longer matches this status; no completed result was recorded.";
@@ -723,6 +1581,14 @@ namespace ResticBackuper.Dashboard
             if (snapshot.StateKey == "success_unchanged")
             {
                 return "All protected files already matched the latest verified snapshot.";
+            }
+            if (snapshot.StateKey == "cancelled")
+            {
+                return "Restic stopped cooperatively. Previously verified snapshots remain available, and this run was not marked successful.";
+            }
+            if (snapshot.StateKey == "cancelling")
+            {
+                return "Restic received a run-bound cancellation request and is stopping cleanly.";
             }
             if (snapshot.IsFailure)
             {
@@ -768,6 +1634,37 @@ namespace ResticBackuper.Dashboard
                 return "Reading this run's scheduled repository-data sample.";
             }
             return "Backup telemetry was received; the current phase is not yet classified.";
+        }
+
+        private static string BuildChangeAnomalyDetail(
+            IDictionary<string, object> document)
+        {
+            IDictionary<string, object> anomaly = GetDictionary(document, "change_anomaly");
+            IDictionary<string, object> measurements = GetDictionary(anomaly, "measurements");
+            List<string> evidence = new List<string>();
+            double deletionRatio = GetDouble(measurements, "deletion_ratio", -1);
+            double changeRatio = GetDouble(measurements, "file_change_ratio", -1);
+            double dataRatio = GetDouble(measurements, "data_added_ratio", -1);
+            if (deletionRatio >= 0)
+            {
+                evidence.Add((deletionRatio * 100).ToString("0.0", CultureInfo.CurrentCulture)
+                    + "% estimated deletions");
+            }
+            if (changeRatio >= 0)
+            {
+                evidence.Add((changeRatio * 100).ToString("0.0", CultureInfo.CurrentCulture)
+                    + "% new or changed files");
+            }
+            if (dataRatio >= 0)
+            {
+                evidence.Add((dataRatio * 100).ToString("0.0", CultureInfo.CurrentCulture)
+                    + "% repository data added versus the prior logical size");
+            }
+            string measurementsText = evidence.Count == 0
+                ? "an unusually large change set"
+                : string.Join(", ", evidence.Take(3).ToArray());
+            return "The snapshot was kept and verified, but " + measurementsText
+                + " triggered a review and maintenance hold. No snapshots were deleted, and this hold does not pause a live DriveFS upload.";
         }
 
         private static string BuildSourceFingerprint(IDictionary<string, object> document)
@@ -816,6 +1713,7 @@ namespace ResticBackuper.Dashboard
                 .ToList();
             List<RunMetricRecord> source = backups;
             bool dryRunOnly = false;
+            bool usesComparableRuns = false;
             if (source.Count == 0)
             {
                 source = historyRecords
@@ -827,10 +1725,22 @@ namespace ResticBackuper.Dashboard
                     .ToList();
                 dryRunOnly = source.Count > 0;
             }
+            if (source.Count == 0)
+            {
+                source = historyRecords
+                    .Where(item => item.Success
+                        && item.TypeKey == "backup"
+                        && !string.Equals(item.RunId, currentRunId, StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(item => item.StartedUtc)
+                    .Take(10)
+                    .ToList();
+                usesComparableRuns = source.Count > 0;
+            }
 
             EstimateBaseline baseline = new EstimateBaseline();
             baseline.SampleCount = source.Count;
             baseline.DryRunOnly = dryRunOnly;
+            baseline.UsesComparableRuns = usesComparableRuns;
             baseline.Files = MedianLong(source.Where(item => item.Files > 0).Select(item => item.Files));
             baseline.Bytes = MedianLong(source.Where(item => item.ProcessedBytes > 0).Select(item => item.ProcessedBytes));
             baseline.TotalDurationSeconds = Median(
@@ -844,7 +1754,8 @@ namespace ResticBackuper.Dashboard
                 baseline.ResticDurationSeconds = baseline.TotalDurationSeconds;
             }
 
-            List<double> overheads = backups
+            IEnumerable<RunMetricRecord> overheadSource = usesComparableRuns ? source : backups;
+            List<double> overheads = overheadSource
                 .Where(item => item.DurationSeconds > item.ResticDurationSeconds
                     && item.ResticDurationSeconds > 0)
                 .Select(item => item.DurationSeconds - item.ResticDurationSeconds)
@@ -872,6 +1783,23 @@ namespace ResticBackuper.Dashboard
         {
             if (phaseIndex == 1)
             {
+                if (baseline.UsesComparableRuns)
+                {
+                    double expectedResticSeconds = ComparableExpectedResticSeconds(
+                        baseline,
+                        filesDone,
+                        bytesDone,
+                        resticElapsed);
+                    if (expectedResticSeconds > 0)
+                    {
+                        double comparableRemaining = Math.Max(
+                            baseline.PostProcessingSeconds,
+                            expectedResticSeconds - resticElapsed
+                                + baseline.PostProcessingSeconds);
+                        return Clamp(comparableRemaining, 0, MaximumEtaSeconds);
+                    }
+                }
+
                 List<double> candidates = new List<double>();
                 double exactRemaining = GetDouble(progress, "seconds_remaining", -1);
                 if (exactRemaining >= 0)
@@ -949,6 +1877,46 @@ namespace ResticBackuper.Dashboard
             return fallback;
         }
 
+        private static double ComparableExpectedResticSeconds(
+            EstimateBaseline baseline,
+            long filesDone,
+            long bytesDone,
+            double resticElapsed)
+        {
+            if (baseline == null || baseline.ResticDurationSeconds <= 0)
+            {
+                return 0;
+            }
+
+            double observedWorkScale = 1;
+            if (baseline.Files > 0 && filesDone > 0)
+            {
+                observedWorkScale = Math.Max(
+                    observedWorkScale,
+                    (double)filesDone / baseline.Files);
+            }
+            if (baseline.Bytes > 0 && bytesDone > 0)
+            {
+                observedWorkScale = Math.Max(
+                    observedWorkScale,
+                    (double)bytesDone / baseline.Bytes);
+            }
+
+            // A different folder set has an unknown amount of work. Once it exceeds
+            // comparable history, reserve headroom instead of implying it is done.
+            double scaleWithHeadroom = observedWorkScale > 1
+                ? observedWorkScale * 1.25
+                : 1;
+            double expected = baseline.ResticDurationSeconds * scaleWithHeadroom;
+            if (expected <= resticElapsed)
+            {
+                expected = resticElapsed + Math.Max(
+                    baseline.PostProcessingSeconds,
+                    baseline.ResticDurationSeconds * 0.25);
+            }
+            return Clamp(expected, 0, MaximumEtaSeconds);
+        }
+
         private string BuildConfidenceLabel(bool exactProgress, EstimateBaseline baseline)
         {
             if (exactProgress)
@@ -959,13 +1927,17 @@ namespace ResticBackuper.Dashboard
             {
                 return "Estimated from verified dry run";
             }
+            if (baseline.UsesComparableRuns)
+            {
+                return "Low-confidence estimate from comparable recent runs";
+            }
             if (baseline.SampleCount >= 5)
             {
-                return "High-confidence median of recent runs";
+                return "High-confidence median of matching folder-set runs";
             }
             if (baseline.SampleCount > 0)
             {
-                return "Estimated from run history";
+                return "Estimated from matching folder-set history";
             }
             return "Learning from this run";
         }
@@ -1009,6 +1981,10 @@ namespace ResticBackuper.Dashboard
                     return new PhaseInfo(3, 4, "Recovery test", "Testing recovery");
                 case "checking_data_subset":
                     return new PhaseInfo(3, 5, "Data sample", "Reading repository data");
+                case "cancelling":
+                    return new PhaseInfo(0, 1, "Canceling", "Stopping backup safely");
+                case "cancelled":
+                    return new PhaseInfo(0, 1, "Canceled", "Backup canceled");
                 case "success":
                     return new PhaseInfo(4, 6, "Complete", "Backup complete");
                 case "success_unchanged":
@@ -1223,7 +2199,8 @@ namespace ResticBackuper.Dashboard
         {
             string state = GetString(document, "state", string.Empty).ToLowerInvariant();
             if (state != "success" && state != "success_unchanged"
-                && state != "failed" && state != "partial")
+                && state != "failed" && state != "partial"
+                && state != "cancelled" && state != "cancel_failed")
             {
                 return null;
             }
@@ -1324,6 +2301,10 @@ namespace ResticBackuper.Dashboard
                     return "Source errors";
                 case "failed":
                     return "Failed";
+                case "cancelled":
+                    return "Canceled";
+                case "cancel_failed":
+                    return "Cancellation failed";
                 default:
                     return state;
             }
@@ -1539,6 +2520,10 @@ namespace ResticBackuper.Dashboard
                 dashboardDirectory,
                 "." + Path.GetFileName(targetFullPath) + "."
                     + Guid.NewGuid().ToString("N") + ".tmp");
+            string backupPath = Path.Combine(
+                dashboardDirectory,
+                "." + Path.GetFileName(targetFullPath) + "."
+                    + Guid.NewGuid().ToString("N") + ".bak");
             try
             {
                 string json = serializer.Serialize(value);
@@ -1557,7 +2542,8 @@ namespace ResticBackuper.Dashboard
 
                 if (File.Exists(targetFullPath))
                 {
-                    File.Replace(temporaryPath, targetFullPath, null, true);
+                    File.Replace(temporaryPath, targetFullPath, backupPath, true);
+                    File.Delete(backupPath);
                 }
                 else
                 {
@@ -1571,7 +2557,8 @@ namespace ResticBackuper.Dashboard
                         {
                             throw;
                         }
-                        File.Replace(temporaryPath, targetFullPath, null, true);
+                        File.Replace(temporaryPath, targetFullPath, backupPath, true);
+                        File.Delete(backupPath);
                     }
                 }
             }
@@ -1598,10 +2585,29 @@ namespace ResticBackuper.Dashboard
                         throw;
                     }
                 }
+                try
+                {
+                    if (File.Exists(backupPath))
+                    {
+                        File.Delete(backupPath);
+                    }
+                }
+                catch (Exception error)
+                {
+                    if (!IsExpectedIoException(error))
+                    {
+                        throw;
+                    }
+                }
             }
         }
 
         private JsonReadResult ReadJsonObject(string path)
+        {
+            return ReadJsonObject(path, MaximumJsonLength);
+        }
+
+        private JsonReadResult ReadJsonObject(string path, int maximumLength)
         {
             if (string.IsNullOrEmpty(path))
             {
@@ -1627,6 +2633,7 @@ namespace ResticBackuper.Dashboard
                     }
 
                     string json;
+                    string sha256;
                     long length;
                     using (FileStream stream = new FileStream(
                         path,
@@ -1635,13 +2642,38 @@ namespace ResticBackuper.Dashboard
                         FileShare.ReadWrite | FileShare.Delete))
                     {
                         length = stream.Length;
-                        if (length > MaximumJsonLength)
+                        if (length > maximumLength)
                         {
                             return JsonReadResult.Invalid(true, length, DateTime.MinValue,
                                 "Telemetry JSON exceeds the safety limit.");
                         }
+                        byte[] payload = new byte[(int)length];
+                        int offset = 0;
+                        while (offset < payload.Length)
+                        {
+                            int read = stream.Read(payload, offset, payload.Length - offset);
+                            if (read <= 0)
+                            {
+                                throw new EndOfStreamException(
+                                    "Telemetry JSON changed while it was read.");
+                            }
+                            offset += read;
+                        }
+                        using (SHA256 algorithm = SHA256.Create())
+                        {
+                            byte[] digest = algorithm.ComputeHash(payload);
+                            StringBuilder hash = new StringBuilder(64);
+                            foreach (byte value in digest)
+                            {
+                                hash.Append(value.ToString(
+                                    "x2",
+                                    CultureInfo.InvariantCulture));
+                            }
+                            sha256 = hash.ToString();
+                        }
+                        using (MemoryStream memory = new MemoryStream(payload, false))
                         using (StreamReader reader = new StreamReader(
-                            stream,
+                            memory,
                             new UTF8Encoding(false, true),
                             true,
                             4096,
@@ -1666,7 +2698,7 @@ namespace ResticBackuper.Dashboard
                     {
                         lastWriteUtc = DateTime.MinValue;
                     }
-                    return JsonReadResult.Valid(document, length, lastWriteUtc);
+                    return JsonReadResult.Valid(document, length, lastWriteUtc, sha256);
                 }
                 catch (Exception error)
                 {
@@ -1905,6 +2937,24 @@ namespace ResticBackuper.Dashboard
             return true;
         }
 
+        private static bool TryReadLastVerifiedFinishedUtc(
+            IDictionary<string, object> document,
+            out DateTime finishedUtc)
+        {
+            finishedUtc = DateTime.MinValue;
+            if (document == null)
+            {
+                return false;
+            }
+            string state = GetString(document, "state", string.Empty).ToLowerInvariant();
+            if ((state != "success" && state != "success_unchanged") ||
+                !GetBool(document, "verification_complete", false))
+            {
+                return false;
+            }
+            return TryGetUtc(document, "finished_utc", out finishedUtc);
+        }
+
         private static double DurationBetween(IDictionary<string, object> source)
         {
             DateTime start;
@@ -2099,6 +3149,7 @@ namespace ResticBackuper.Dashboard
         public IDictionary<string, object> Document { get; private set; }
         public long Length { get; private set; }
         public DateTime LastWriteUtc { get; private set; }
+        public string Sha256 { get; private set; }
         public string Error { get; private set; }
 
         public static JsonReadResult Missing()
@@ -2108,6 +3159,7 @@ namespace ResticBackuper.Dashboard
                 Exists = false,
                 Length = 0,
                 LastWriteUtc = DateTime.MinValue,
+                Sha256 = string.Empty,
                 Error = string.Empty
             };
         }
@@ -2115,7 +3167,8 @@ namespace ResticBackuper.Dashboard
         public static JsonReadResult Valid(
             IDictionary<string, object> document,
             long length,
-            DateTime lastWriteUtc)
+            DateTime lastWriteUtc,
+            string sha256)
         {
             return new JsonReadResult
             {
@@ -2123,6 +3176,7 @@ namespace ResticBackuper.Dashboard
                 Document = document,
                 Length = length,
                 LastWriteUtc = lastWriteUtc,
+                Sha256 = sha256 ?? string.Empty,
                 Error = string.Empty
             };
         }
@@ -2138,6 +3192,7 @@ namespace ResticBackuper.Dashboard
                 Exists = exists,
                 Length = length,
                 LastWriteUtc = lastWriteUtc,
+                Sha256 = string.Empty,
                 Error = error ?? "Telemetry JSON is invalid."
             };
         }
@@ -2163,6 +3218,7 @@ namespace ResticBackuper.Dashboard
     {
         public int SampleCount { get; set; }
         public bool DryRunOnly { get; set; }
+        public bool UsesComparableRuns { get; set; }
         public long Files { get; set; }
         public long Bytes { get; set; }
         public double TotalDurationSeconds { get; set; }

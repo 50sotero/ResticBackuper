@@ -14,14 +14,21 @@ if (-not [Environment]::Is64BitOperatingSystem -or -not [Environment]::Is64BitPr
 }
 
 $productName = 'ResticBackuper'
+$productDisplayName = 'Rewindle'
 $backupTaskName = 'ResticBackuper'
 $dashboardTaskName = 'ResticBackuperDashboard'
+$cloudVerificationTaskName = 'ResticBackuperGoogleDriveSync'
+$primaryTaskEvidenceName = 'scheduled-task.xml'
+$cloudTaskEvidenceName = 'google-drive-verification-task.xml'
 $programFilesRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
 $programDataRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
 $systemDirectory = [Environment]::SystemDirectory
 $windowsPowerShell = Join-Path $systemDirectory 'WindowsPowerShell\v1.0\powershell.exe'
 $installRoot = Join-Path $programFilesRoot $productName
 $stateRoot = Join-Path $programDataRoot $productName
+$cloudVerificationRoot = Join-Path (
+    $programDataRoot
+) 'ResticBackuperCloudVerification'
 $installRegistry = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ResticBackuper'
 $startMenuShortcut = Join-Path $programDataRoot 'Microsoft\Windows\Start Menu\Programs\ResticBackuper.lnk'
 
@@ -64,6 +71,16 @@ function Invoke-SelfElevation {
 function Get-NormalizedPath {
     param([string]$Path)
     return [IO.Path]::GetFullPath($Path).TrimEnd('\')
+}
+
+function Read-Utf8Json {
+    param([string]$Path)
+
+    $text = [IO.File]::ReadAllText(
+        [IO.Path]::GetFullPath($Path),
+        [Text.UTF8Encoding]::new($false, $true)
+    )
+    return $text | ConvertFrom-Json
 }
 
 function Assert-NormalDirectory {
@@ -120,6 +137,8 @@ function Assert-OwnedRuntime {
 
     $allowed = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     [void]$allowed.Add('runtime-manifest.json')
+    [void]$allowed.Add($primaryTaskEvidenceName)
+    [void]$allowed.Add($cloudTaskEvidenceName)
     foreach ($entry in $manifest.files) {
         $relative = [string]$entry.relative_path
         if (-not $relative -or [IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..' -or -not $allowed.Add($relative)) {
@@ -172,6 +191,19 @@ function Assert-OwnedTask {
     return $task
 }
 
+function Convert-TaskPrincipalToSid {
+    param([string]$UserId)
+
+    try {
+        return ([Security.Principal.SecurityIdentifier]$UserId).Value
+    }
+    catch {
+        return ([Security.Principal.NTAccount]$UserId).Translate(
+            [Security.Principal.SecurityIdentifier]
+        ).Value
+    }
+}
+
 function Stop-OwnedProcesses {
     param(
         [string]$ProcessName,
@@ -215,25 +247,71 @@ if ($ExpectedUserSid -and $ExpectedUserSid -ne $currentSid) {
 Import-TrustedScheduledTasksModule
 
 $null = Assert-OwnedRuntime
-$backupTask = Assert-OwnedTask -TaskName $backupTaskName -ExpectedExecutable (Join-Path $installRoot 'ResticBackuperTaskLauncher.exe')
-$dashboardExecutable = Join-Path $installRoot 'ResticBackuperDashboard.exe'
-$dashboardArguments = '--minimized --state-dir "{0}"' -f $stateRoot
-$dashboardTask = Assert-OwnedTask -TaskName $dashboardTaskName -ExpectedExecutable $dashboardExecutable -ExpectedArguments $dashboardArguments
-
 $configuration = $null
 $configurationPath = Join-Path $installRoot 'backup-config.json'
 if (Test-Path -LiteralPath $configurationPath -PathType Leaf) {
     try {
-        $configuration = Get-Content -LiteralPath $configurationPath -Raw | ConvertFrom-Json
+        $configuration = Read-Utf8Json -Path $configurationPath
     }
     catch {
         Write-Warning "Could not read display-only uninstall metadata; continuing with protected runtime ownership checks: $($_.Exception.Message)"
     }
 }
+$backupTask = Assert-OwnedTask `
+    -TaskName $backupTaskName `
+    -ExpectedExecutable (Join-Path $installRoot 'ResticBackuperTaskLauncher.exe')
+$dashboardExecutable = Join-Path $installRoot 'ResticBackuperDashboard.exe'
+$dashboardArguments = '--minimized --state-dir "{0}"' -f $stateRoot
+$dashboardTask = Assert-OwnedTask `
+    -TaskName $dashboardTaskName `
+    -ExpectedExecutable $dashboardExecutable `
+    -ExpectedArguments $dashboardArguments
+
+$cloudTask = $null
+$cloudTaskCandidate = Get-ScheduledTask `
+    -TaskName $cloudVerificationTaskName `
+    -ErrorAction SilentlyContinue
+if ($null -ne $cloudTaskCandidate) {
+    if ($null -eq $configuration -or
+        [string]$configuration.repository_storage_mode -cne
+            'google_drivefs_stream') {
+        throw 'The Google Drive verification task lacks matching protected configuration.'
+    }
+    $repositoryStatePath = Join-Path $stateRoot 'repository.json'
+    if (-not (Test-Path -LiteralPath $repositoryStatePath -PathType Leaf)) {
+        throw 'The Google Drive verification task lacks protected repository identity.'
+    }
+    $repositoryState = Read-Utf8Json -Path $repositoryStatePath
+    $repositoryId = [string]$repositoryState.repository_id
+    if ($repositoryState.schema_version -ne 1 -or
+        $repositoryId -cnotmatch '^[0-9a-f]{64}$' -or
+        (Get-NormalizedPath ([string]$repositoryState.repository)) -ne
+            (Get-NormalizedPath ([string]$configuration.repository))) {
+        throw 'The Google Drive verification task repository identity is invalid.'
+    }
+    $cloudArguments = (
+        '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass ' +
+        '-WindowStyle Hidden -File "' +
+        (Join-Path $installRoot 'verify_my_drive_cloud_repository.ps1') +
+        '" -ConfigPath "' + $configurationPath +
+        '" -CloudVerificationRoot "' + $cloudVerificationRoot +
+        '" -ExpectedRepositoryId "' + $repositoryId + '"'
+    )
+    $cloudTask = Assert-OwnedTask `
+        -TaskName $cloudVerificationTaskName `
+        -ExpectedExecutable $windowsPowerShell `
+        -ExpectedArguments $cloudArguments
+    if ($null -eq $cloudTask -or
+        (Convert-TaskPrincipalToSid `
+            -UserId ([string]$cloudTask.Principal.UserId)) -cne
+        $currentSid) {
+        throw 'The Google Drive verification task belongs to another account.'
+    }
+}
 
 if (-not $Unattended) {
     Write-Host ''
-    Write-Host 'ResticBackuper uninstall' -ForegroundColor Cyan
+    Write-Host "$productDisplayName uninstall" -ForegroundColor Cyan
     Write-Host "  App runtime : $installRoot"
     Write-Host "  Preserved   : $stateRoot"
     if ($configuration) {
@@ -246,13 +324,17 @@ if (-not $Unattended) {
     }
 }
 
-foreach ($task in @($dashboardTask, $backupTask)) {
+foreach ($task in @($cloudTask, $dashboardTask, $backupTask)) {
     if ($task -and $task.State -eq 'Running') {
         Stop-ScheduledTask -InputObject $task -ErrorAction Stop
     }
 }
 $stopDeadline = [DateTime]::UtcNow.AddSeconds(20)
-foreach ($taskName in @($dashboardTaskName, $backupTaskName)) {
+foreach ($taskName in @(
+    $cloudVerificationTaskName,
+    $dashboardTaskName,
+    $backupTaskName
+)) {
     while ([DateTime]::UtcNow -lt $stopDeadline) {
         $currentTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if (-not $currentTask -or $currentTask.State -ne 'Running') {
@@ -267,7 +349,7 @@ foreach ($taskName in @($dashboardTaskName, $backupTaskName)) {
 }
 Stop-OwnedProcesses -ProcessName 'ResticBackuperDashboard' -ExpectedExecutable $dashboardExecutable
 Stop-OwnedProcesses -ProcessName 'ResticBackuperTaskLauncher' -ExpectedExecutable (Join-Path $installRoot 'ResticBackuperTaskLauncher.exe')
-foreach ($task in @($dashboardTask, $backupTask)) {
+foreach ($task in @($cloudTask, $dashboardTask, $backupTask)) {
     if ($task) {
         Unregister-ScheduledTask -InputObject $task -Confirm:$false
     }
@@ -294,7 +376,8 @@ if (Test-Path -LiteralPath $startMenuShortcut -PathType Leaf) {
 
 if (Test-Path -LiteralPath $installRegistry) {
     $registration = Get-ItemProperty -LiteralPath $installRegistry
-    if ($registration.DisplayName -eq $productName -and (Get-NormalizedPath ([string]$registration.InstallLocation)) -eq (Get-NormalizedPath $installRoot)) {
+    if (($registration.DisplayName -eq $productName -or $registration.DisplayName -eq $productDisplayName) -and
+        (Get-NormalizedPath ([string]$registration.InstallLocation)) -eq (Get-NormalizedPath $installRoot)) {
         Remove-Item -LiteralPath $installRegistry -Recurse -Force
     }
     else {
@@ -303,8 +386,11 @@ if (Test-Path -LiteralPath $installRegistry) {
 }
 
 Write-Host ''
-Write-Host 'ResticBackuper app components were removed.' -ForegroundColor Green
+Write-Host "$productDisplayName app components were removed." -ForegroundColor Green
 Write-Host "Preserved backup state: $stateRoot"
+if (Test-Path -LiteralPath $cloudVerificationRoot -PathType Container) {
+    Write-Host "Preserved cloud verification assets/evidence: $cloudVerificationRoot"
+}
 if ($configuration) {
     Write-Host "Preserved repository: $($configuration.repository)"
     Write-Host "Preserved recovery key: $($configuration.recovery_key_file)"

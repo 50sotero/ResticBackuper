@@ -19,9 +19,11 @@ from restic_common import (
     atomic_write_json,
     ensure_free_space,
     load_config,
+    repository_storage_mode,
     restic_base,
     run_capture,
     utc_now,
+    validate_repository_storage_readiness,
     validate_repository_volume,
 )
 from secret_store import create_secret, load_secret, secure_directory, write_recovery_key
@@ -94,9 +96,13 @@ def install_recovery_tools(config: dict, config_path: Path) -> dict:
         "schema_version": 1,
         "created_utc": utc_now(),
         "repository": config["repository"],
+        "repository_storage_mode": repository_storage_mode(config),
         "files": manifest_files,
         "note": "The repository password is intentionally not stored in this bundle.",
     }
+    if manifest["repository_storage_mode"] == "google_drivefs_stream":
+        manifest["drivefs_my_drive_root"] = config["drivefs_my_drive_root"]
+        manifest["drivefs_cache_directory"] = config["drivefs_cache_directory"]
     atomic_write_json(destination / "recovery-manifest.json", manifest)
     return manifest
 
@@ -116,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     state = Path(config["state_directory"])
     secret_file = Path(config["secret_file"])
     recovery_file = Path(config["recovery_key_file"])
+    storage_mode = repository_storage_mode(config)
 
     secure_directory(state)
     with RunLock(state / "run.lock"):
@@ -149,9 +156,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"{cat_result.stderr.strip() or cat_result.stdout.strip()}"
                 )
             repository_config = json.loads(cat_result.stdout)
-            secure_directory(repository)
+            if storage_mode == "local_ntfs":
+                secure_directory(repository)
         else:
-            secure_directory(repository)
+            if storage_mode == "local_ntfs":
+                secure_directory(repository)
             result = run_capture(
                 restic_base(config) + ["init", "--repository-version", "2"]
             )
@@ -166,6 +175,11 @@ def main(argv: list[str] | None = None) -> int:
                     f"repository authentication failed after init: {cat_result.stderr.strip()}"
                 )
             repository_config = json.loads(cat_result.stdout)
+        if storage_mode == "google_drivefs_stream":
+            validate_repository_storage_readiness(
+                config,
+                volume_validated=True,
+            )
 
         recovery_created = False
         if password is None:
@@ -189,11 +203,17 @@ def main(argv: list[str] | None = None) -> int:
             "repository_id": repository_config.get("id"),
             "repository_version": repository_config.get("version"),
             "repository_volume_serial": config["repository_volume_serial"],
+            "repository_storage_mode": storage_mode,
             "secret_created": secret_created,
             "recovery_key_created": recovery_created,
             "recovery_tools_directory": config["recovery_tools_directory"],
             "recovery_tools_manifest": recovery_tools,
         }
+        if storage_mode == "google_drivefs_stream":
+            state_record["drivefs_my_drive_root"] = config["drivefs_my_drive_root"]
+            state_record["drivefs_cache_directory"] = config[
+                "drivefs_cache_directory"
+            ]
         atomic_write_json(state / "repository.json", state_record)
 
     print(
@@ -202,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
                 "repository": str(repository),
                 "repository_id": repository_config.get("id"),
                 "repository_version": repository_config.get("version"),
+                "repository_storage_mode": storage_mode,
                 "secret_file": str(secret_file),
                 "recovery_key_file": str(recovery_file),
                 "secret_created": secret_created,

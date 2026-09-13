@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $projectRoot = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) '..')).TrimEnd('\')
 $version = (Get-Content -LiteralPath (Join-Path $projectRoot 'VERSION') -Raw).Trim()
 if (-not $Artifact) {
-    $Artifact = Join-Path $projectRoot "artifacts\ResticBackuper-v$version-windows-x64.zip"
+    $Artifact = Join-Path $projectRoot "artifacts\Rewindle-v$version-windows-x64.zip"
 }
 $artifactPath = [IO.Path]::GetFullPath($Artifact)
 if (-not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
@@ -27,6 +27,8 @@ $state = Join-Path $workspace 'state'
 $recoveryTools = Join-Path $workspace 'RecoveryTools'
 $recoveryKey = Join-Path $workspace 'RecoveryKey.txt'
 $restoreTarget = Join-Path $workspace 'restored'
+$drillTarget = Join-Path $workspace 'recovery-drill'
+$drillReport = Join-Path $state 'artifact-recovery-drill.json'
 
 function Invoke-EmbeddedPython {
     param([string[]]$Arguments)
@@ -73,8 +75,29 @@ try {
     foreach ($item in Get-ChildItem -LiteralPath (Join-Path $bundle 'payload') -Force) {
         Copy-Item -LiteralPath $item.FullName -Destination $runtime -Recurse
     }
+    foreach ($offsitePayload in @(
+        'verify_my_drive_cloud_repository.ps1',
+        'verify_cloud_repository_inventory.py',
+        'reveal-rclone-config-password.ps1',
+        'install_google_drive_sync_task.ps1'
+    )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $runtime $offsitePayload) -PathType Leaf)) {
+            throw "Optional direct Google Drive verification payload is missing: $offsitePayload"
+        }
+    }
+    foreach ($recoveryPayload in @(
+        'recovery_health.py',
+        'restore.py',
+        'Manage-Restore.ps1',
+        'ResticBackuperDashboard.exe'
+    )) {
+        if (-not (Test-Path -LiteralPath (Join-Path $runtime $recoveryPayload) -PathType Leaf)) {
+            throw "Guided recovery payload is missing: $recoveryPayload"
+        }
+    }
 
     [IO.File]::WriteAllText((Join-Path $source 'document.txt'), 'integration backup version 1', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText((Join-Path $source 'notes.txt'), 'bounded representative restore sample', [Text.UTF8Encoding]::new($false))
     [IO.File]::WriteAllText((Join-Path $source 'backup-canary.txt'), 'ResticBackuper integration restore canary', [Text.UTF8Encoding]::new($false))
 
     $driveRoot = [IO.Path]::GetPathRoot($workspace)
@@ -84,10 +107,13 @@ try {
         throw "Could not determine volume serial for $driveRoot"
     }
     $configPath = Join-Path $runtime 'backup-config.json'
+    $fixtureVolumeSerial = ([string]$disk.VolumeSerialNumber).ToUpperInvariant()
     $configuration = [ordered]@{
         schema_version = 1
+        plan_id = '87654321-4321-4abc-8def-1234567890ab'
+        config_generation = 1
         repository = $repository
-        repository_volume_serial = ([string]$disk.VolumeSerialNumber).ToUpperInvariant()
+        repository_volume_serial = $fixtureVolumeSerial
         restic_executable = Join-Path $runtime 'restic.exe'
         recovery_tools_directory = $recoveryTools
         python_executable = Join-Path $runtime 'Python\python.exe'
@@ -104,7 +130,19 @@ try {
         structural_check_after_backup = $true
         read_data_subset_weekday = [DateTime]::Today.DayOfWeek.ToString()
         read_data_subset_parts = 30
+        cloud_placeholder_policy = 'strict'
+        change_anomaly = [ordered]@{
+            enabled = $true
+            file_change_ratio = 0.35
+            deletion_ratio = 0.15
+            data_added_ratio = 0.50
+            minimum_changed_files = 1000
+        }
         sources = @($source)
+        source_identities = [ordered]@{}
+    }
+    $configuration.source_identities[$source] = [ordered]@{
+        expected_volume_serial = $fixtureVolumeSerial
     }
     [IO.File]::WriteAllText($configPath, ($configuration | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
 
@@ -116,6 +154,42 @@ try {
 
     [IO.File]::WriteAllText((Join-Path $source 'document.txt'), 'integration backup version 2 with changed length', [Text.UTF8Encoding]::new($false))
     Invoke-EmbeddedPython -Arguments @((Join-Path $runtime 'backup.py'), '--config', $configPath)
+
+    $lastSuccess = Get-Content -LiteralPath (Join-Path $state 'last-success.json') -Raw | ConvertFrom-Json
+    $canaryProof = $lastSuccess.verification.canary
+    $repositoryConfigHashBeforeDrill = (Get-FileHash -LiteralPath (Join-Path $repository 'config') -Algorithm SHA256).Hash
+    $sourceHashesBeforeDrill = @{}
+    foreach ($sourceFile in Get-ChildItem -LiteralPath $source -File) {
+        $sourceHashesBeforeDrill[$sourceFile.Name] = (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash
+    }
+    Invoke-EmbeddedPython -Arguments @(
+        (Join-Path $runtime 'restore.py'),
+        '--config', $configPath,
+        '--snapshot', [string]$lastSuccess.snapshot_id,
+        '--target', $drillTarget,
+        '--report', $drillReport,
+        '--recovery-key-file', $recoveryKey,
+        '--recovery-drill',
+        '--drill-canary-sha256', [string]$canaryProof.sha256,
+        '--drill-canary-bytes', [string]$canaryProof.bytes
+    )
+    $drill = Get-Content -LiteralPath $drillReport -Raw | ConvertFrom-Json
+    $drillFiles = @(Get-ChildItem -LiteralPath $drillTarget -Recurse -File)
+    if (-not $drill.verified -or [string]$drill.result -cne 'verified' -or
+        [string]$drill.drill_kind -cne 'recovery_key_representative' -or
+        [string]$drill.credential_source -cne 'recovery_key' -or
+        -not $drill.canary_verified -or [int]$drill.sample_file_count -lt 2 -or
+        $drillFiles.Count -ne ([int]$drill.sample_file_count + 1)) {
+        throw 'Packaged recovery-key representative drill did not produce complete bounded evidence.'
+    }
+    if ((Get-FileHash -LiteralPath (Join-Path $repository 'config') -Algorithm SHA256).Hash -cne $repositoryConfigHashBeforeDrill) {
+        throw 'Packaged recovery drill changed the repository configuration.'
+    }
+    foreach ($sourceFile in Get-ChildItem -LiteralPath $source -File) {
+        if ($sourceHashesBeforeDrill[$sourceFile.Name] -cne (Get-FileHash -LiteralPath $sourceFile.FullName -Algorithm SHA256).Hash) {
+            throw "Packaged recovery drill changed source data: $($sourceFile.Name)"
+        }
+    }
 
     Invoke-EmbeddedPython -Arguments @(
         (Join-Path $runtime 'restore.py'),
@@ -145,6 +219,8 @@ try {
         snapshots = $snapshots.Count
         verified_backups = 2
         independent_restore = $true
+        recovery_key_drill = $true
+        recovery_drill_files = $drillFiles.Count
         payload_manifest = $true
         workspace = if ($KeepWorkspace) { $workspace } else { $null }
     } | ConvertTo-Json -Depth 4

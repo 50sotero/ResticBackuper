@@ -65,23 +65,6 @@ def _windows_libraries():
     return crypt32, kernel32
 
 
-def _system_executable(name: str) -> str:
-    """Resolve a Windows utility without consulting CWD, PATH, or env vars."""
-    if os.name != "nt" or not name.lower().endswith(".exe"):
-        raise RuntimeError("trusted Windows utility resolution is unavailable")
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetSystemDirectoryW.argtypes = [wintypes.LPWSTR, wintypes.UINT]
-    kernel32.GetSystemDirectoryW.restype = wintypes.UINT
-    buffer = ctypes.create_unicode_buffer(32768)
-    length = kernel32.GetSystemDirectoryW(buffer, len(buffer))
-    if length == 0 or length >= len(buffer):
-        raise ctypes.WinError(ctypes.get_last_error())
-    executable = Path(buffer.value) / name
-    if not executable.is_file():
-        raise FileNotFoundError(f"required Windows utility is missing: {executable}")
-    return str(executable)
-
-
 def _input_blob(data: bytes) -> tuple[DATA_BLOB, ctypes.Array]:
     buffer = ctypes.create_string_buffer(data)
     blob = DATA_BLOB(
@@ -96,7 +79,7 @@ def protect(secret: bytes) -> bytes:
     output_blob = DATA_BLOB()
     if not crypt32.CryptProtectData(
         ctypes.byref(input_blob),
-        "ResticBackuper repository password",
+        "Restic personal backup repository password",
         None,
         None,
         None,
@@ -157,7 +140,7 @@ def _atomic_create(path: Path, data: bytes) -> None:
 
 def _current_user_sid() -> str:
     result = subprocess.run(
-        [_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+        ["whoami.exe", "/user", "/fo", "csv", "/nh"],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -181,13 +164,7 @@ def restrict_acl(path: Path, *, directory: bool = False) -> None:
         f"*S-1-5-32-544:{suffix}",
     ]
     result = subprocess.run(
-        [
-            _system_executable("icacls.exe"),
-            str(path),
-            "/inheritance:r",
-            "/grant:r",
-            *grants,
-        ],
+        ["icacls.exe", str(path), "/inheritance:r", "/grant:r", *grants],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -197,15 +174,34 @@ def restrict_acl(path: Path, *, directory: bool = False) -> None:
     )
     if result.returncode != 0:
         raise RuntimeError(f"could not restrict ACL on {path}: {result.stderr.strip()}")
+    # Some user-profile folders contribute an explicit OWNER RIGHTS entry even
+    # after inherited ACEs are removed. The current SID already has an exact
+    # full-control grant, so keeping that generic owner grant would only make
+    # later ownership changes broaden access.
+    owner_rights = subprocess.run(
+        ["icacls.exe", str(path), "/remove:g", "*S-1-3-4"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if owner_rights.returncode != 0:
+        raise RuntimeError(
+            f"could not remove generic owner rights on {path}: "
+            f"{owner_rights.stderr.strip()}"
+        )
     verify_restricted_acl(path, user_sid)
 
 
-def _dacl_sddl(path: Path) -> str:
+def _security_sddl(path: Path, *, include_owner: bool = False) -> str:
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
     security_descriptor = ctypes.c_void_p()
+    owner = ctypes.c_void_p()
     dacl = ctypes.c_void_p()
     get_named = advapi32.GetNamedSecurityInfoW
     get_named.argtypes = [
@@ -219,11 +215,12 @@ def _dacl_sddl(path: Path) -> str:
         ctypes.POINTER(ctypes.c_void_p),
     ]
     get_named.restype = wintypes.DWORD
+    information = 0x4 | (0x1 if include_owner else 0)
     error = get_named(
         str(path),
         1,  # SE_FILE_OBJECT
-        0x4,  # DACL_SECURITY_INFORMATION
-        None,
+        information,
+        ctypes.byref(owner) if include_owner else None,
         None,
         ctypes.byref(dacl),
         None,
@@ -246,7 +243,7 @@ def _dacl_sddl(path: Path) -> str:
         if not convert(
             security_descriptor,
             1,
-            0x4,
+            information,
             ctypes.byref(text_pointer),
             ctypes.byref(text_length),
         ):
@@ -259,6 +256,10 @@ def _dacl_sddl(path: Path) -> str:
         kernel32.LocalFree(security_descriptor)
 
 
+def _dacl_sddl(path: Path) -> str:
+    return _security_sddl(path)
+
+
 def verify_restricted_acl(path: Path, user_sid: str | None = None) -> None:
     current_sid = user_sid or _current_user_sid()
     sddl = _dacl_sddl(path)
@@ -266,10 +267,8 @@ def verify_restricted_acl(path: Path, user_sid: str | None = None) -> None:
     if not prefix.startswith("D:") or "P" not in prefix[2:]:
         raise RuntimeError(f"ACL inheritance is not protected on {path}: {sddl}")
     allowed_sids = {current_sid, "SY", "BA", "S-1-5-18", "S-1-5-32-544"}
-    # Windows renders the machine's built-in Administrator account (RID 500)
-    # as the SDDL alias ``LA``. Accept that alias only when it represents the
-    # current DPAPI user; otherwise an explicit local-Administrator ACE remains
-    # an unexpected principal.
+    # Windows renders the built-in Administrator account (RID 500) as ``LA``.
+    # Accept it only when that account is the current DPAPI owner.
     if current_sid.rsplit("-", 1)[-1] == "500":
         allowed_sids.add("LA")
     entries = re.findall(r"\(([^)]*)\)", sddl)
@@ -281,6 +280,60 @@ def verify_restricted_acl(path: Path, user_sid: str | None = None) -> None:
             raise RuntimeError(f"ACL has a non-full-control allow entry on {path}: {entry}")
         if fields[5] not in allowed_sids:
             raise RuntimeError(f"ACL grants an unexpected principal on {path}: {entry}")
+
+
+def verify_protected_readonly_acl(path: Path, user_sid: str | None = None) -> None:
+    """Verify an Administrator-owned proof file readable but not writable by its user."""
+
+    current_sid = user_sid or _current_user_sid()
+    sddl = _security_sddl(path, include_owner=True)
+    owner_match = re.search(r"O:(.*?)(?=[GDS]:)", sddl)
+    if owner_match is None or owner_match.group(1) not in {"BA", "S-1-5-32-544"}:
+        raise RuntimeError(f"ACL owner is not Administrators on {path}: {sddl}")
+    dacl_index = sddl.find("D:")
+    if dacl_index < 0:
+        raise RuntimeError(f"ACL has no DACL on {path}: {sddl}")
+    dacl = sddl[dacl_index:]
+    prefix = dacl.split("(", 1)[0]
+    if "P" not in prefix[2:]:
+        raise RuntimeError(f"ACL inheritance is not protected on {path}: {sddl}")
+    allowed_sids = {
+        current_sid,
+        "SY",
+        "BA",
+        "OW",
+        "S-1-5-18",
+        "S-1-5-32-544",
+        "S-1-3-4",
+    }
+    required = {"SY", "BA", current_sid}
+    seen: set[str] = set()
+    write_mask = 0x00000116 | 0x00040000 | 0x00080000 | 0x00010000
+    for entry in re.findall(r"\(([^)]*)\)", dacl):
+        fields = entry.split(";")
+        if len(fields) < 6 or fields[0] != "A" or fields[1]:
+            raise RuntimeError(f"ACL contains an inherited or non-allow entry on {path}: {entry}")
+        sid = fields[5]
+        if sid not in allowed_sids:
+            raise RuntimeError(f"ACL grants an unexpected principal on {path}: {entry}")
+        rights = fields[2]
+        if sid in {current_sid, "OW", "S-1-3-4"}:
+            if rights in {"FA", "FW", "GA", "GW"}:
+                raise RuntimeError(f"ACL grants write access to the normal user on {path}: {entry}")
+            if rights.startswith("0x") and int(rights, 16) & write_mask:
+                raise RuntimeError(f"ACL grants write access to the normal user on {path}: {entry}")
+        if sid in {"SY", "S-1-5-18"}:
+            seen.add("SY")
+            if rights not in {"FA", "GA"}:
+                raise RuntimeError(f"SYSTEM lacks full control on {path}: {entry}")
+        elif sid in {"BA", "S-1-5-32-544"}:
+            seen.add("BA")
+            if rights not in {"FA", "GA"}:
+                raise RuntimeError(f"Administrators lack full control on {path}: {entry}")
+        elif sid == current_sid:
+            seen.add(current_sid)
+    if not required.issubset(seen):
+        raise RuntimeError(f"ACL is missing a required principal on {path}: {sddl}")
 
 
 def secure_directory(path: Path) -> None:
@@ -306,6 +359,91 @@ def create_secret(path: Path) -> str:
     return password
 
 
+def _secret_envelope_bytes(password: str) -> bytes:
+    try:
+        encoded = password.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("repository password must be ASCII") from error
+    if len(password) < 40 or any(character.isspace() for character in password):
+        raise ValueError("repository password is invalid or unexpectedly short")
+    envelope = {
+        "schema_version": SCHEMA_VERSION,
+        "protection": "Windows DPAPI CurrentUser",
+        "ciphertext_base64": base64.b64encode(protect(encoded)).decode("ascii"),
+    }
+    return (json.dumps(envelope, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def replace_secret(path: Path, password: str) -> None:
+    """Atomically replace/create one CurrentUser envelope after a round trip.
+
+    The original bytes are restored if any post-publication verification fails.
+    Plaintext is never written to disk.
+    """
+
+    path = path.resolve(strict=False)
+    if path.exists() and (not path.is_file() or path.is_symlink()):
+        raise RuntimeError(f"secret target is not a normal file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = path.read_bytes() if path.exists() else None
+    data = _secret_envelope_bytes(password)
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.repair.tmp")
+    rollback: Path | None = None
+    published = False
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        restrict_acl(temporary)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = None
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if load_secret(temporary) != password:
+            raise RuntimeError("staged DPAPI secret did not round-trip")
+        os.replace(temporary, path)
+        published = True
+        verify_restricted_acl(path)
+        if load_secret(path) != password:
+            raise RuntimeError("published DPAPI secret did not round-trip")
+    except BaseException as error:
+        rollback_errors: list[str] = []
+        if published:
+            try:
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    rollback = path.with_name(
+                        f".{path.name}.{secrets.token_hex(8)}.rollback.tmp"
+                    )
+                    rollback_descriptor = os.open(
+                        rollback, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                    )
+                    try:
+                        restrict_acl(rollback)
+                        with os.fdopen(rollback_descriptor, "wb") as handle:
+                            rollback_descriptor = -1
+                            handle.write(original)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                    finally:
+                        if rollback_descriptor >= 0:
+                            os.close(rollback_descriptor)
+                    os.replace(rollback, path)
+                    rollback = None
+            except BaseException as rollback_error:
+                rollback_errors.append(f"secret rollback failed: {rollback_error}")
+        if rollback_errors:
+            raise RuntimeError(f"{error}; {'; '.join(rollback_errors)}") from error
+        raise
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+        if rollback is not None:
+            rollback.unlink(missing_ok=True)
+
+
 def load_secret(path: Path) -> str:
     envelope = json.loads(path.read_text(encoding="utf-8"))
     if envelope.get("schema_version") != SCHEMA_VERSION:
@@ -321,7 +459,7 @@ def load_secret(path: Path) -> str:
 
 def write_recovery_key(path: Path, repository: Path, password: str) -> None:
     content = (
-        "RESTICBACKUPER RECOVERY KEY\r\n"
+        "RESTIC PERSONAL BACKUP RECOVERY KEY\r\n"
         "===================================\r\n\r\n"
         f"Repository: {repository}\r\n"
         f"Password: {password}\r\n\r\n"

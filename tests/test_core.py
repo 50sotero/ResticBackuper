@@ -18,6 +18,7 @@ sys.path.insert(0, str(SOURCE))
 import backup
 import dry_run
 import restic_common
+import recovery_health
 import restore
 import secret_store
 
@@ -41,10 +42,13 @@ class CoreSafetyTests(unittest.TestCase):
         canary = root / "canary.txt"
         canary.write_text("ResticBackuper test canary\n", encoding="utf-8")
         config_path = root / "backup-config.test.json"
+        configured_sources = [str(item) for item in (sources or [source])]
         config_path.write_text(
             json.dumps(
                 {
                     "schema_version": 1,
+                    "plan_id": "11111111-1111-4111-8111-111111111111",
+                    "config_generation": 1,
                     "repository": str(repository),
                     "repository_volume_serial": "00000000",
                     "restic_executable": str(restic),
@@ -57,7 +61,12 @@ class CoreSafetyTests(unittest.TestCase):
                     "canary_file": str(canary),
                     "hostname": "RESTICBACKUPER-TEST",
                     "scheduled_tag": "scheduled-test",
-                    "sources": [str(item) for item in (sources or [source])],
+                    "cloud_placeholder_policy": "strict",
+                    "sources": configured_sources,
+                    "source_identities": {
+                        item: {"expected_volume_serial": "00000000"}
+                        for item in configured_sources
+                    },
                 }
             ),
             encoding="utf-8",
@@ -121,8 +130,47 @@ class CoreSafetyTests(unittest.TestCase):
                 sources=[source],
             )
 
-            with self.assertRaisesRegex(ValueError, "repository and source overlap"):
+            with self.assertRaisesRegex(ValueError, "(?:repository and source|source and repository) overlap"):
                 restic_common.load_config(config_path, require_repository=False)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows DOS path aliases")
+    def test_short_path_aliases_cannot_bypass_repository_guards(self) -> None:
+        import ctypes
+
+        with tempfile.TemporaryDirectory(prefix="resticbackuper-path-alias-") as root_text:
+            root = Path(root_text).resolve()
+            get_short_path = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+            get_short_path.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            get_short_path.restype = ctypes.c_uint32
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_short_path(str(root), buffer, len(buffer))
+            self.assertGreater(length, 0)
+            alias = Path(buffer.value)
+            if str(alias).casefold() == str(root).casefold():
+                self.skipTest("temporary volume has DOS alias generation disabled")
+
+            source = root / "source"
+            source.mkdir()
+            alias_source = alias / "source"
+            self.assertEqual(str(source), restic_common.canonical_windows_path(alias_source))
+            self.assertEqual(
+                str(source / "not-created" / "report.json"),
+                restic_common.canonical_windows_path(alias_source / "not-created" / "report.json"),
+            )
+            config_path = self._write_config(
+                root, repository=source / "repository", sources=[alias_source],
+            )
+            with self.assertRaisesRegex(ValueError, "source and repository.*overlap"):
+                restic_common.load_config(config_path, require_repository=False)
+            self.assertTrue(restore.is_within(alias_source / "report.json", source))
+            self.assertTrue(restore._is_within_windows_path(alias_source, source))
+            self.assertEqual(
+                source, restore.select_configured_source(alias_source, [str(source)]),
+            )
+            key = root / "separate-recovery.txt"
+            password = "test-fixture-" + "x" * 40
+            key.write_text(f"Repository: {alias_source}\nPassword: {password}\n", encoding="utf-8")
+            self.assertEqual(password, recovery_health.parse_recovery_key(key, source))
 
     def test_load_config_rejects_unsafe_exclusion(self) -> None:
         with tempfile.TemporaryDirectory(prefix="resticbackuper-exclude-") as root_text:
@@ -208,6 +256,11 @@ class CoreSafetyTests(unittest.TestCase):
             self.assertTrue(paused.wait(timeout=10), "worker did not reach pre-lock pause")
             with restic_common.RunLock(state / "run.lock"):
                 config["sources"] = [str(old_source), str(new_source)]
+                config["source_identities"] = {
+                    str(old_source): {"expected_volume_serial": "00000000"},
+                    str(new_source): {"expected_volume_serial": "00000000"},
+                }
+                config["config_generation"] += 1
                 config_path.write_text(json.dumps(config), encoding="utf-8")
             continue_to_lock.set()
             thread.join(timeout=10)
@@ -318,11 +371,17 @@ class CoreSafetyTests(unittest.TestCase):
         config = {
             "hostname": "Backup-Host",
             "sources": [r"C:\BackupSource\Documents", r"D:\Projects"],
+            "plan_id": "11111111-1111-4111-8111-111111111111",
+            "config_generation": 1,
         }
         older = {
             "id": "older",
             "hostname": "BACKUP-HOST",
-            "tags": ["scheduled"],
+            "tags": [
+                "scheduled",
+                "restic-backuper-plan:11111111-1111-4111-8111-111111111111",
+                "restic-backuper-generation:1",
+            ],
             "paths": [r"d:\projects", r"c:\backupsource\documents"],
             "time": "2026-01-01T01:00:00Z",
         }

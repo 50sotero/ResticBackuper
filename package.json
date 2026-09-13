@@ -1,0 +1,30 @@
+{
+  "name": "rewindle",
+  "productName": "Rewindle",
+  "version": "0.2.0-alpha.1",
+  "description": "Backup you can verify",
+  "private": true,
+  "main": "desktop/main.cjs",
+  "author": "Rewindle contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "prepare-web": "bash desktop/scripts/prepare-web.sh",
+    "fetch-restic": "bash desktop/scripts/fetch-restic.sh",
+    "smoke-test": "node desktop/scripts/smoke-test.cjs",
+    "smoke-test:packaged": "node desktop/scripts/smoke-test.cjs --app desktop/dist/mac-arm64/Rewindle.app",
+    "smoke-test:packaged:x64": "node desktop/scripts/smoke-test.cjs --app desktop/dist/mac/Rewindle.app",
+    "dist:mac": "electron-builder --config desktop/electron-builder.yml --mac dmg zip --publish never",
+    "dist:mac:arm64": "bash desktop/scripts/build-mac.sh arm64",
+    "dist:mac:x64": "bash desktop/scripts/build-mac.sh x64"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "electron": "43.7.0",
+    "electron-builder": "26.16.1"
+  }
+}
